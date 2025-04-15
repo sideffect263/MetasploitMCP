@@ -4,6 +4,8 @@ import contextlib
 import logging
 import os
 import shlex # Still needed for console command quoting
+import pathlib
+from datetime import datetime
 # Removed subprocess import as msfvenom is no longer called directly
 from typing import List, Dict, Any, Optional, Tuple, Union
 
@@ -333,10 +335,11 @@ async def generate_payload(
     template_path: Optional[str] = None,
     keep_template: bool = False,
     force_encode: bool = False,
+    output_filename: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Generate a Metasploit payload using the RPC API (payload.payload_generate).
-    This avoids the need for msfvenom in the system PATH.
+    Saves the generated payload to a file on the server if generation is successful.
 
     Args:
         payload_type: Type of payload (e.g., windows/meterpreter/reverse_tcp).
@@ -349,10 +352,11 @@ async def generate_payload(
         template_path: Optional path to an executable template.
         keep_template: Keep the template working (requires template_path).
         force_encode: Force encoding even if not needed by bad chars.
+        output_filename: Optional desired filename (without path). If None, a default name is generated.
 
     Returns:
-        Dictionary containing status, message, and payload size/info.
-        Does NOT return raw payload bytes directly in JSON.
+        Dictionary containing status, message, payload size/info,
+        and potentially the server-side path where the payload was saved.
     """
     global _msf_client_instance
     if _msf_client_instance is None: return {"status": "error", "message": "MSF client not initialized."}
@@ -396,29 +400,69 @@ async def generate_payload(
 
         # Generate the payload bytes
         logger.info("Calling payload_generate()...")
-        raw_payload_bytes: bytes = await asyncio.to_thread(payload.payload_generate) # Expects bytes
+        raw_payload_bytes = await asyncio.to_thread(payload.payload_generate) # Expects bytes
 
         if isinstance(raw_payload_bytes, bytes):
             payload_size = len(raw_payload_bytes)
             logger.info(f"Payload generation successful. Size: {payload_size} bytes.")
-            # Optionally save to a file server-side? Or return base64?
-            # For now, just confirm success and size.
-            # Example: Save to a temporary file (ensure cleanup)
-            # temp_filename = f"payload_{payload_type.replace('/', '_')}.{format_type}"
-            # with open(temp_filename, "wb") as f:
-            #     f.write(raw_payload_bytes)
-            # logger.info(f"Payload saved locally as {temp_filename}")
-            # message = f"Payload generated successfully ({payload_size} bytes) and saved server-side as {temp_filename}."
-
-            # Example: Return Base64 (only for reasonably small payloads)
-            # if payload_size < 1024 * 100: # Limit base64 return to < 100KB
-            #    payload_base64 = base64.b64encode(raw_payload_bytes).decode('ascii')
-            #    return {"status": "success", "message": f"Payload generated successfully ({payload_size} bytes).", "payload_size": payload_size, "payload_base64": payload_base64}
-            # else:
-            #    return {"status": "success", "message": f"Payload generated successfully ({payload_size} bytes). Payload too large to return directly.", "payload_size": payload_size}
-
-            # Simple confirmation message:
-            return {"status": "success", "message": f"Payload '{payload_type}' generated successfully.", "payload_size": payload_size, "format": format_type}
+            
+            # Determine save directory
+            save_directory = os.environ.get('PAYLOAD_SAVE_DIR')
+            if not save_directory:
+                # Default to ~/payloads
+                save_directory = str(pathlib.Path.home() / "payloads")
+            
+            # Ensure directory exists
+            try:
+                os.makedirs(save_directory, exist_ok=True)
+                logger.debug(f"Ensuring payload directory exists: {save_directory}")
+            except OSError as e:
+                logger.error(f"Failed to create payload save directory {save_directory}: {e}")
+                return {
+                    "status": "error", 
+                    "message": f"Payload generated successfully ({payload_size} bytes) but could not create save directory: {e}",
+                    "payload_size": payload_size, 
+                    "format": format_type
+                }
+            
+            # Determine filename
+            final_filename = None
+            if output_filename:
+                # Basic sanitization - allow only alphanumeric, underscore, hyphen, dot
+                import re
+                sanitized = re.sub(r'[^a-zA-Z0-9_\-.]', '_', output_filename)
+                if sanitized:
+                    final_filename = sanitized
+            
+            if not final_filename:
+                # Create default filename
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                safe_payload_type = payload_type.replace('/', '_')
+                final_filename = f"payload_{safe_payload_type}_{timestamp}.{format_type}"
+            
+            # Full save path
+            save_path = os.path.join(save_directory, final_filename)
+            
+            # Write payload to file
+            try:
+                with open(save_path, "wb") as f:
+                    f.write(raw_payload_bytes)
+                logger.info(f"Payload saved to {save_path}")
+                return {
+                    "status": "success", 
+                    "message": f"Payload '{payload_type}' generated successfully and saved.", 
+                    "payload_size": payload_size, 
+                    "format": format_type,
+                    "server_save_path": save_path
+                }
+            except IOError as e:
+                logger.error(f"Failed to write payload to {save_path}: {e}")
+                return {
+                    "status": "error", 
+                    "message": f"Payload generated but failed to save to file: {e}", 
+                    "payload_size": payload_size, 
+                    "format": format_type
+                }
 
         elif isinstance(raw_payload_bytes, str): # Should return bytes, but handle error strings
              logger.error(f"Payload generation failed. payload_generate returned string: {raw_payload_bytes}")
