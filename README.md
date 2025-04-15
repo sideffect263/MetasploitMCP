@@ -58,10 +58,10 @@ This MCP server provides a bridge between large language models like Claude and 
 
 ## Usage
 
-Run the MCP server:
+Start the Metasploit RPC service:
 
 ```bash
-python MetasploitMCP.py
+msfrpcd -P yourpassword -S -a 127.0.0.1 -p 55553
 ```
 
 For Claude Desktop integration, configure `claude_desktop_config.json`:
