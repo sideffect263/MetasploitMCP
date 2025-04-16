@@ -5,6 +5,7 @@ import logging
 import os
 import shlex # Still needed for console command quoting
 import pathlib
+import subprocess # For executing local programs
 from datetime import datetime
 # Removed subprocess import as msfvenom is no longer called directly
 from typing import List, Dict, Any, Optional, Tuple, Union
@@ -1598,6 +1599,83 @@ async def stop_job(job_id: int) -> Dict[str, Any]:
     except Exception as e:
         logger.exception(f"Unexpected error stopping job {job_id}.")
         return {"status": "error", "message": f"Unexpected error stopping job {job_id}: {str(e)}"}
+
+
+@mcp.tool()
+async def execute_local_program(program_path: str) -> Dict[str, Any]:
+    """
+    Execute a program at the specified local path.
+    
+    This function attempts to execute arbitrary files on your local system.
+    Only use it with files you have created and trust (e.g., payloads you generated).
+    
+    Args:
+        program_path: Full path to the program to execute (typically a path returned by generate_payload)
+        
+    Returns:
+        Dictionary with execution status and details
+    """
+    logger.info(f"Attempting to execute local program: {program_path}")
+    
+    # Validate path exists and is a file
+    if not os.path.exists(program_path):
+        logger.error(f"Path does not exist: {program_path}")
+        return {
+            "status": "error", 
+            "message": "Invalid path: File does not exist.", 
+            "path_checked": program_path
+        }
+    
+    if not os.path.isfile(program_path):
+        logger.error(f"Path is not a file: {program_path}")
+        return {
+            "status": "error", 
+            "message": "Invalid path: Not a file.", 
+            "path_checked": program_path
+        }
+    
+    # Attempt to execute the program
+    try:
+        # Use subprocess.Popen to launch the program asynchronously without blocking
+        await asyncio.to_thread(subprocess.Popen, [program_path])
+        
+        logger.info(f"Successfully launched program: {program_path}")
+        return {
+            "status": "success",
+            "message": f"Attempted to launch program in the background: {program_path}"
+        }
+    except FileNotFoundError as e:
+        logger.error(f"FileNotFoundError executing {program_path}: {e}")
+        return {
+            "status": "error",
+            "message": "Failed to launch program: File not found.",
+            "path_attempted": program_path,
+            "error_details": str(e)
+        }
+    except PermissionError as e:
+        logger.error(f"PermissionError executing {program_path}: {e}")
+        return {
+            "status": "error",
+            "message": "Failed to launch program: Permission denied.",
+            "path_attempted": program_path,
+            "error_details": str(e)
+        }
+    except OSError as e:
+        logger.error(f"OSError executing {program_path}: {e}")
+        return {
+            "status": "error",
+            "message": "Failed to launch program: OS error.",
+            "path_attempted": program_path,
+            "error_details": str(e)
+        }
+    except Exception as e:
+        logger.exception(f"Unexpected error executing {program_path}")
+        return {
+            "status": "error",
+            "message": "Failed to launch program due to an unexpected error.",
+            "path_attempted": program_path,
+            "error_details": str(e)
+        }
 
 
 # --- FastAPI Application Setup ---

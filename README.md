@@ -8,11 +8,15 @@ This MCP server provides a bridge between large language models like Claude and 
 
 ## Features
 
+### Payload Generation and Execution
+
+- **generate_payload**: Generate payload files using Metasploit RPC (saves files locally)
+- **execute_local_program**: Execute a locally saved program (e.g., generated payloads)
+
 ### Exploitation Workflow
 
 - **list_exploits**: Search and list available Metasploit exploit modules
 - **list_payloads**: Search and list available Metasploit payload modules
-- **generate_payload**: Generate payload files using Metasploit RPC (saves files locally)
 - **run_exploit**: Configure and execute an exploit against a target
 - **list_active_sessions**: Show current Metasploit sessions
 - **send_session_command**: Run a command in an active session
@@ -103,7 +107,7 @@ This tool provides direct access to Metasploit Framework capabilities, which inc
 1. List available exploits: `list_exploits("ms17_010")`
 2. Select and run an exploit: `run_exploit("exploit/windows/smb/ms17_010_eternalblue", "192.168.1.100", 445)`
 3. List sessions: `list_active_sessions()`
-4. Run commands: `send_session_command(1, "whoami")`
+4. Run commands: `send_session_command(1, "getuid")`
 
 ### Post-Exploitation
 
