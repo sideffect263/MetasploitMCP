@@ -7,7 +7,6 @@ import shlex # Still needed for console command quoting
 import pathlib
 import subprocess # For executing local programs
 from datetime import datetime
-# Removed subprocess import as msfvenom is no longer called directly
 from typing import List, Dict, Any, Optional, Tuple, Union
 
 # Third-party Libraries
