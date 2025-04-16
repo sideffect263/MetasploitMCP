@@ -107,7 +107,7 @@ This tool provides direct access to Metasploit Framework capabilities, which inc
 1. List available exploits: `list_exploits("ms17_010")`
 2. Select and run an exploit: `run_exploit("exploit/windows/smb/ms17_010_eternalblue", "192.168.1.100", 445)`
 3. List sessions: `list_active_sessions()`
-4. Run commands: `send_session_command(1, "getuid")`
+4. Run commands: `send_session_command(1, "whoami")`
 
 ### Post-Exploitation
 

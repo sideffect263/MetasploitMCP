@@ -499,7 +499,7 @@ async def run_exploit(
     Uses the payload object passing method for asynchronous runs if payload_options are set.
 
     Args:
-        module_name: Name of the exploit module (e.g., 'windows/smb/ms17_010_eternalblue').
+        module_name: Name of the exploit module (e.g., 'unix/ftp/vsftpd_234_backdoor' or 'exploit/unix/ftp/vsftpd_234_backdoor').
         options: Dictionary of exploit module options (e.g., {'RHOSTS': '192.168.1.1'}).
         payload_name: Name of the payload to use (e.g., 'windows/meterpreter/reverse_tcp').
         payload_options: Dictionary of payload options (e.g., {'LHOST': '192.168.1.100', 'LPORT': 4444}).
@@ -512,54 +512,137 @@ async def run_exploit(
     global _msf_client_instance
     if _msf_client_instance is None: return {"status": "error", "message": "MSF client not initialized."}
 
-    logger.info(f"Running exploit {module_name}. Run as job: {run_as_job}. Options: {options}, Payload: {payload_name}, Payload Opts: {payload_options}")
+    logger.info(f"Running exploit '{module_name}'. Run as job: {run_as_job}. Options: {options}, Payload: {payload_name}, Payload Opts: {payload_options}")
 
-    if '/' not in module_name: module_name = f"exploit/{module_name}"
-    elif not module_name.startswith('exploit/'):
-        logger.error(f"Invalid exploit module name: {module_name}")
-        return {"status": "error", "message": f"Invalid exploit module name: {module_name}."}
+    # --- Determine full and base module names ---
+    if module_name.startswith('exploit/'):
+        full_module_path = module_name
+        base_module_name = module_name.split('/', 1)[1] if len(module_name.split('/', 1)) > 1 else ""
+    elif '/' in module_name: # Assume it's a relative path like 'unix/ftp/...'
+        full_module_path = f"exploit/{module_name}"
+        base_module_name = module_name
+    else:
+        # Handle cases where only the final part might be provided, although less common for exploits
+        logger.error(f"Ambiguous exploit module format: '{module_name}'. Please provide path like 'platform/service/name'.")
+        return {"status": "error", "message": f"Ambiguous exploit module format: '{module_name}'. Provide path."}
+
+    logger.debug(f"Derived Full Path: '{full_module_path}', Base Name for modules.use(): '{base_module_name}'")
+    
+    if not base_module_name:
+        logger.error(f"Invalid exploit module name (empty base name): {module_name}")
+        return {"status": "error", "message": f"Invalid exploit module name: {module_name}"}
 
     module_options = options or {}
     final_payload_options = payload_options or {}
-    payload_to_pass: Union[str, object, None] = payload_name # Default to string
+    payload_base_name_for_use = None
 
     try:
+        # --- Validate module existence ---
+        logger.debug("Checking if exploit module exists in Metasploit...")
+        available_exploits = await asyncio.to_thread(lambda: _msf_client_instance.modules.exploits)
+        if full_module_path not in available_exploits and base_module_name not in available_exploits:
+            # Try more flexible search (endswith check)
+            found_match = False
+            for exploit in available_exploits:
+                if exploit.endswith('/' + base_module_name):
+                    found_match = True
+                    logger.warning(f"Module found with different prefix: '{exploit}'. Proceeding with base path.")
+                    break
+            if not found_match:
+                logger.error(f"Exploit module '{full_module_path}' (or '{base_module_name}') not found in Metasploit's list.")
+                return {"status": "error", "message": f"Exploit module '{module_name}' not found in Metasploit."}
+        else:
+            logger.debug(f"Exploit module '{full_module_path}' or '{base_module_name}' confirmed.")
+
         # --- Get the exploit module object ---
-        base_module_name = module_name.replace('exploit/', '', 1)
+        # Use the relative path (base_module_name) for modules.use()
         module_obj = await asyncio.to_thread(lambda: _msf_client_instance.modules.use('exploit', base_module_name))
-        logger.debug(f"Retrieved exploit module object for '{base_module_name}'")
+        logger.debug(f"Successfully retrieved exploit module object for '{base_module_name}'")
 
         # --- Set exploit options ---
         for k, v in module_options.items():
+            # Basic type guessing (can be refined)
             if isinstance(v, str):
-                if v.isdigit(): v = int(v)
-                elif v.lower() in ('true', 'false'): v = v.lower() == 'true'
+                if v.isdigit():
+                    try: v = int(v)
+                    except ValueError: pass # Keep as string if conversion fails
+                elif v.lower() in ('true', 'false'):
+                    v = v.lower() == 'true'
             await asyncio.to_thread(lambda key=k, value=v: module_obj.__setitem__(key, value))
-            # logger.debug(f"Set exploit option {k}={v}")
 
-        # --- Prepare payload object if needed (for async execution) ---
-        if run_as_job and payload_name and final_payload_options:
-            logger.debug(f"Preparing payload object '{payload_name}' with options for async execution.")
-            payload_obj = await asyncio.to_thread(lambda: _msf_client_instance.modules.use('payload', payload_name))
-            for k, v in final_payload_options.items():
-                if isinstance(v, str):
-                    if v.isdigit(): v = int(v)
-                    elif v.lower() in ('true', 'false'): v = v.lower() == 'true'
-                await asyncio.to_thread(lambda key=k, value=v: payload_obj.__setitem__(key, value))
-                # logger.debug(f"Set payload object option {k}={v}")
-            payload_to_pass = payload_obj # Pass the configured object
-            logger.info(f"Executing exploit with configured payload object.")
-        elif run_as_job and payload_name:
-            # Pass payload name string if no specific options needed for the object method
-             logger.info(f"Executing exploit with payload name string '{payload_name}'.")
-             payload_to_pass = payload_name
-
+        # --- Prepare payload object if needed ---
+        payload_obj_to_pass = None
+        if payload_name:
+            # Validate payload exists
+            available_payloads = await asyncio.to_thread(lambda: _msf_client_instance.modules.payloads)
+            
+            # Check if payload name is in the available payloads list
+            payload_found = False
+            actual_payload_path = None
+            
+            # Direct match
+            if payload_name in available_payloads:
+                payload_found = True
+                actual_payload_path = payload_name
+            # Check if it's a relative path that exists
+            elif any(p.endswith('/' + payload_name) for p in available_payloads):
+                for p in available_payloads:
+                    if p.endswith('/' + payload_name):
+                        payload_found = True
+                        actual_payload_path = p
+                        break
+            # Check with 'payload/' prefix
+            elif f"payload/{payload_name}" in available_payloads:
+                payload_found = True
+                actual_payload_path = payload_name
+            # Check for partial match if it contains a slash
+            elif '/' in payload_name:
+                for p in available_payloads:
+                    if payload_name in p:
+                        payload_found = True
+                        actual_payload_path = p
+                        logger.info(f"Found partial payload match: {p} for input {payload_name}")
+                        break
+            
+            if not payload_found:
+                logger.error(f"Payload '{payload_name}' not found in available Metasploit payloads.")
+                return {"status": "error", "message": f"Payload '{payload_name}' not found."}
+            
+            # Extract base name for modules.use call
+            if actual_payload_path:
+                # If the path has 'payload/' prefix, remove it for modules.use
+                if actual_payload_path.startswith('payload/'):
+                    payload_base_name_for_use = actual_payload_path.split('/', 1)[1]
+                else:
+                    payload_base_name_for_use = actual_payload_path
+                logger.debug(f"Using payload path '{payload_base_name_for_use}' for modules.use")
+            else:
+                payload_base_name_for_use = payload_name
+            
+            # Prepare payload object only if options are provided or running async
+            if run_as_job or final_payload_options:
+                logger.debug(f"Preparing payload object '{payload_base_name_for_use}' with options for execution.")
+                payload_obj = await asyncio.to_thread(lambda: _msf_client_instance.modules.use('payload', payload_base_name_for_use))
+                for k, v in final_payload_options.items():
+                    if isinstance(v, str):
+                        if v.isdigit():
+                            try: v = int(v)
+                            except ValueError: pass
+                        elif v.lower() in ('true', 'false'):
+                            v = v.lower() == 'true'
+                    await asyncio.to_thread(lambda key=k, value=v: payload_obj.__setitem__(key, value))
+                payload_obj_to_pass = payload_obj
+                logger.info(f"Executing exploit with configured payload object.")
+            else:
+                logger.info(f"Will set payload name '{payload_base_name_for_use}' via console for synchronous run.")
 
         # --- Execute ---
         if run_as_job:
             # --- Asynchronous Execution (Run as Job) ---
-            logger.info(f"Calling module_obj.execute(payload={type(payload_to_pass)}) for background job.")
-            exec_result = await asyncio.to_thread(lambda: module_obj.execute(payload=payload_to_pass))
+            # Pass the payload object if configured, otherwise pass the validated name string, or None
+            payload_arg = payload_obj_to_pass if payload_obj_to_pass else (payload_base_name_for_use if payload_name else None)
+            logger.info(f"Calling module_obj.execute(payload={type(payload_arg)}) for background job.")
+            exec_result = await asyncio.to_thread(lambda: module_obj.execute(payload=payload_arg))
             logger.info(f"module_obj.execute() result: {exec_result}")
 
             # Process job result
@@ -569,9 +652,9 @@ async def run_exploit(
                 if 'error' in exec_result and exec_result['error']:
                     error_message = f"Failed to start exploit job: {exec_result.get('error_message', exec_result.get('error_string', 'Unknown error'))}"
                     logger.error(error_message)
-                    return {"status": "error", "message": error_message, "module": module_name}
+                    return {"status": "error", "message": error_message, "module": full_module_path}
                 elif job_id is not None:
-                    message = f"Exploit module {module_name} started as job {job_id}."
+                    message = f"Exploit module {full_module_path} started as job {job_id}."
                     # Check for associated session quickly
                     await asyncio.sleep(1.5) # Give session time to potentially appear
                     sessions_list = await asyncio.to_thread(lambda: _msf_client_instance.sessions.list)
@@ -586,36 +669,40 @@ async def run_exploit(
                             break
                     return {
                         "status": "success", "message": message, "job_id": job_id, "uuid": uuid,
-                        "session_id": found_session_id, "module": module_name, "options": module_options,
+                        "session_id": found_session_id, "module": full_module_path, "options": module_options,
                         "payload_name": payload_name, "payload_options": final_payload_options
                     }
                 else:
                     logger.warning(f"Exploit job executed but no job_id returned: {exec_result}")
-                    return {"status": "unknown", "message": "Exploit executed, but no job ID returned.", "result": exec_result, "module": module_name}
+                    return {"status": "unknown", "message": "Exploit executed, but no job ID returned.", "result": exec_result, "module": full_module_path}
             else:
                 logger.error(f"Unexpected result format from exploit execute: {exec_result}")
-                return {"status": "error", "message": f"Unexpected result format from exploit execution: {exec_result}", "module": module_name}
+                return {"status": "error", "message": f"Unexpected result format from exploit execution: {exec_result}", "module": full_module_path}
 
         else:
             # --- Synchronous Execution (via Console) ---
-            # TODO: Consider alternative using console.run_module_with_output(module_obj, payload=payload_name)
-            logger.info(f"Executing {module_name} synchronously via console.")
+            logger.info(f"Executing {full_module_path} synchronously via console.")
             async with get_msf_console() as console:
-                setup_commands = [f"use {module_name}"]
+                # Use the FULL module path for the 'use' command in console
+                setup_commands = [f"use {full_module_path}"]
                 # Add exploit options
                 for key, value in module_options.items():
                     val_str = str(value)
                     if isinstance(value, str) and (' ' in val_str or '"' in val_str or "'" in val_str):
                          val_str = shlex.quote(val_str)
+                    elif isinstance(value, bool): # Ensure booleans are lowercase for console
+                        val_str = str(value).lower()
                     setup_commands.append(f"set {key} {val_str}")
 
                 # Add payload and payload options (for console mode, set directly)
-                if payload_name:
-                    setup_commands.append(f"set PAYLOAD {payload_name}")
+                if payload_name and payload_base_name_for_use:
+                    setup_commands.append(f"set PAYLOAD {payload_base_name_for_use}")
                     for key, value in final_payload_options.items():
                         val_str = str(value)
                         if isinstance(value, str) and (' ' in val_str or '"' in val_str or "'" in val_str):
                              val_str = shlex.quote(val_str)
+                        elif isinstance(value, bool): # Ensure booleans are lowercase
+                            val_str = str(value).lower()
                         setup_commands.append(f"set {key} {val_str}")
 
                 final_command = "exploit" # Synchronous command
@@ -624,7 +711,7 @@ async def run_exploit(
                 for cmd in setup_commands:
                     logger.debug(f"Running setup command: {cmd}")
                     setup_output = await run_command_safely(console, cmd, execution_timeout=15)
-                    if "[-] Error setting" in setup_output or "Invalid option" in setup_output: # Check for setup errors
+                    if "[-] Error setting" in setup_output or "Invalid option" in setup_output or "[-] No results" in setup_output:
                          error_msg = f"Error during setup command '{cmd}': {setup_output}"
                          logger.error(error_msg)
                          return {"status": "error", "message": error_msg}
@@ -637,42 +724,52 @@ async def run_exploit(
 
                 # Try to parse session ID from output
                 session_id = None
+                session_opened_line = ""
                 for line in module_output.splitlines():
-                     if "session" in line.lower() and "opened" in line.lower():
-                         try:
-                             parts = line.split()
-                             for i, part in enumerate(parts):
-                                 if part.lower() == "session" and i + 1 < len(parts) and parts[i + 1].isdigit():
-                                     session_id = int(parts[i + 1])
-                                     logger.info(f"Detected session {session_id} opened in output.")
-                                     break
-                             if session_id: break
-                         except (ValueError, IndexError): pass # Ignore parsing errors
+                    lower_line = line.lower()
+                    if ("session" in lower_line and "opened" in lower_line) or \
+                       ("command shell session" in lower_line and "opened" in lower_line):
+                        try:
+                            parts = line.split()
+                            for i, part in enumerate(parts):
+                                if part.isdigit() and i > 0 and parts[i-1].lower() == "session":
+                                    session_id = int(part)
+                                    session_opened_line = line # Store the line where it was found
+                                    logger.info(f"Detected session {session_id} opened in output: '{line}'")
+                                    break
+                            if session_id: break
+                        except (ValueError, IndexError): pass # Ignore parsing errors
 
                 return {
                     "status": "success",
-                    "message": f"Exploit module {module_name} completed synchronously.",
+                    "message": f"Exploit module {full_module_path} completed synchronously.",
                     "module_output": module_output,
                     "session_id_detected": session_id,
-                    "module": module_name,
+                    "session_opened_line": session_opened_line if session_id else "",
+                    "module": full_module_path,
                     "options": module_options,
                     "payload_name": payload_name,
                     "payload_options": final_payload_options
                 }
 
     except MsfRpcError as e:
-        if "Unknown module" in str(e) or "failed to load" in str(e).lower():
-            logger.error(f"Exploit module {module_name} not found/failed load: {e}")
-            return {"status": "error", "message": f"Exploit module {module_name} not found or failed to load."}
-        elif "Invalid Payload" in str(e):
-            logger.error(f"Invalid payload specified for exploit {module_name}: {payload_name}")
+        # More specific error checking
+        error_str = str(e).lower()
+        if "unknown module" in error_str or "failed to load" in error_str:
+            logger.error(f"Metasploit Error: Exploit module '{module_name}' not found or failed to load: {e}")
+            return {"status": "error", "message": f"Exploit module '{module_name}' not found or failed to load in Metasploit."}
+        elif "invalid payload" in error_str:
+            logger.error(f"Metasploit Error: Invalid payload specified for exploit {full_module_path}: {payload_name} - {e}")
             return {"status": "error", "message": f"Invalid payload specified: {payload_name}"}
-        logger.error(f"MsfRpcError running exploit {module_name}: {e}")
-        return {"status": "error", "message": f"Error running exploit: {str(e)}"}
+        elif "missing required option" in error_str or "invalid option value" in error_str:
+            logger.error(f"Metasploit Error: Missing or invalid option for {full_module_path}: {e}")
+            return {"status": "error", "message": f"Missing or invalid option provided for exploit: {e}"}
+        else:
+            logger.error(f"MsfRpcError running exploit {full_module_path}: {e}")
+            return {"status": "error", "message": f"Metasploit RPC Error running exploit: {str(e)}"}
     except Exception as e:
-        logger.exception(f"Unexpected error running exploit {module_name}")
-        return {"status": "error", "message": f"Unexpected error running exploit: {str(e)}"}
-
+        logger.exception(f"Unexpected error running exploit {full_module_path}")
+        return {"status": "error", "message": f"Unexpected server error running exploit: {str(e)}"}
 
 @mcp.tool()
 async def run_post_module(
