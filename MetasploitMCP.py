@@ -1,225 +1,128 @@
+# -*- coding: utf-8 -*-
 import asyncio
-import base64 # For potentially returning payload bytes safely
+import base64
 import contextlib
 import logging
 import os
-import shlex # Still needed for console command quoting
 import pathlib
-import subprocess # For executing local programs
+import re
+import shlex
+import socket
+import subprocess
+import sys
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-# Third-party Libraries
+# --- Third-party Libraries ---
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from mcp.server.fastmcp import FastMCP
-from pymetasploit3.msfrpc import MsfRpcClient, MsfRpcError, MsfConsole
-from starlette.applications import Starlette
 from mcp.server.sse import SseServerTransport
-from starlette.requests import Request
+from pymetasploit3.msfrpc import MsfConsole, MsfRpcClient, MsfRpcError
+from starlette.applications import Starlette
 from starlette.routing import Mount, Route
 
-# --- Configuration ---
+# --- Configuration & Constants ---
 
-# Configure basic logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("metasploit_mcp_server")
 
+# Metasploit Connection Config (from environment variables)
+MSF_PASSWORD = os.environ.get('MSF_PASSWORD', 'yourpassword')
+MSF_SERVER = os.getenv('MSF_SERVER', '127.0.0.1')
+MSF_PORT_STR = os.getenv('MSF_PORT', '55553')
+MSF_SSL_STR = os.getenv('MSF_SSL', 'false')
+PAYLOAD_SAVE_DIR = os.environ.get('PAYLOAD_SAVE_DIR', str(pathlib.Path.home() / "payloads"))
+
+# Timeouts and Polling Intervals (in seconds)
+DEFAULT_CONSOLE_READ_TIMEOUT = 15  # Default for quick console commands
+LONG_CONSOLE_READ_TIMEOUT = 60   # For commands like run/exploit/check
+SESSION_COMMAND_TIMEOUT = 60     # Default for commands within sessions
+SESSION_READ_INACTIVITY_TIMEOUT = 10 # Timeout if no data from session
+EXPLOIT_SESSION_POLL_TIMEOUT = 60 # Max time to wait for session after exploit job
+EXPLOIT_SESSION_POLL_INTERVAL = 2  # How often to check for session
+
+# Regular Expressions for Prompt Detection
+MSF_PROMPT_RE = re.compile(rb'\x01\x02msf\d+\x01\x02 \x01\x02> \x01\x02') # Matches the msf6 > prompt with control chars
+SHELL_PROMPT_RE = re.compile(r'([#$>]|%)\s*$') # Matches common shell prompts (#, $, >, %) at end of line
+
 # --- Metasploit Client Setup ---
 
-# Global variable to hold the client instance (initialized at startup)
 _msf_client_instance: Optional[MsfRpcClient] = None
 
-def safe_get_data(result: Any, default: str = "") -> str:
+def initialize_msf_client() -> MsfRpcClient:
     """
-    Safely extract 'data' field from a result object that might be a dictionary or something else.
-
-    Args:
-        result: Object that might be a dictionary with a 'data' field or some other type
-        default: Default value to return if data can't be extracted
-
-    Returns:
-        The 'data' value if available, string representation of result, or default value
+    Initializes the global Metasploit RPC client instance.
+    Raises exceptions on failure.
     """
-    if isinstance(result, dict) and 'data' in result:
-        return result.get('data', default)
-    elif hasattr(result, 'data'):
-        # Handle objects with a data attribute
-        try:
-            return str(result.data)
-        except Exception as e:
-            logger.warning(f"Error accessing data attribute: {e}")
-    elif hasattr(result, 'read'):
-        # Handle objects with a read method (like MsfConsole or Session)
-        # Avoid reading here as it consumes output needed elsewhere
-        logger.debug("safe_get_data encountered readable object, returning str representation.")
-        return str(result)
-    elif result is not None:
-        try:
-            return str(result)
-        except Exception as e:
-            logger.warning(f"Error converting result to string: {e}")
-    return default
-
-async def run_command_safely(console: Any, cmd: str, execution_timeout: Optional[int] = None) -> str:
-    """
-    Safely run a command on a Metasploit console and return the output.
-    Handles reading data from the console object's read() method.
-
-    Args:
-        console: The Metasploit console object (MsfConsole).
-        cmd: The command to run.
-        execution_timeout: Optional specific timeout for this command's execution phase.
-
-    Returns:
-        The command output as a string.
-    """
-    try:
-        logger.debug(f"Running console command: {cmd}")
-
-        # Ensure console object has expected methods
-        if not (hasattr(console, 'write') and hasattr(console, 'read') and hasattr(console, 'is_busy')):
-            logger.error(f"Console object {type(console)} lacks required methods (write, read, is_busy).")
-            raise TypeError("Unsupported console object type for command execution.")
-
-        await asyncio.to_thread(console.write, cmd + '\n') # Ensure newline
-
-        output_buffer = ""
-        start_time = asyncio.get_event_loop().time()
-
-        # Determine read timeout
-        read_timeout = 10 # Default timeout
-        is_long_command = cmd.strip().startswith(("run", "exploit", "check"))
-        if is_long_command:
-            read_timeout = 60
-        if execution_timeout is not None:
-            read_timeout = execution_timeout
-            logger.debug(f"Using specified execution timeout: {read_timeout}s")
-
-        check_interval = 0.2 # Seconds between checks
-        last_data_time = start_time
-
-        while True:
-            await asyncio.sleep(check_interval)
-            current_time = asyncio.get_event_loop().time()
-
-            # Read available data without blocking indefinitely
-            chunk_result = await asyncio.to_thread(console.read)
-            chunk_data = ""
-
-            # Check if console.read() returned the documented dictionary
-            if isinstance(chunk_result, dict):
-                chunk_data = chunk_result.get('data', '')
-                is_busy_from_read = chunk_result.get('busy', True) # Assume busy if key missing
-                # logger.debug(f"Read dict: data_len={len(chunk_data)}, busy={is_busy_from_read}")
-            elif isinstance(chunk_result, str): # Fallback if it returns raw string
-                chunk_data = chunk_result
-                # logger.debug(f"Read raw string: len={len(chunk_data)}")
-            # else: logger.debug(f"Read unexpected type: {type(chunk_result)}")
-
-            if chunk_data:
-                # logger.debug(f"Read chunk: {chunk_data}")
-                output_buffer += chunk_data
-                last_data_time = current_time # Reset timeout since we got data
-
-            # Check for timeout based on *inactivity*
-            if (current_time - last_data_time) > read_timeout:
-                logger.debug(f"Read inactivity timeout ({read_timeout}s) reached for command '{cmd}'.")
-                break
-
-            # Check busy status explicitly - might help break loop faster
-            try:
-                # Only check busy status if it's likely relevant (e.g., after some initial wait/inactivity)
-                if (current_time - last_data_time) > 1.0:
-                    is_busy_explicit = await asyncio.to_thread(console.is_busy)
-                    # logger.debug(f"Console busy status (explicit): {is_busy_explicit}")
-                    if not is_busy_explicit:
-                        # Double-check read buffer one last time after busy reports false
-                        final_chunk_result = await asyncio.to_thread(console.read)
-                        final_chunk_data = final_chunk_result.get('data', '') if isinstance(final_chunk_result, dict) else (final_chunk_result if isinstance(final_chunk_result, str) else '')
-                        if final_chunk_data:
-                           output_buffer += final_chunk_data
-                        logger.debug("Console reported not busy and final read was empty, ending read loop.")
-                        break
-            except Exception as busy_err:
-                 # logger.warning(f"Could not check console busy status: {busy_err}")
-                 pass # Ignore busy check errors silently for now
-
-        logger.debug(f"Final output for '{cmd}' (length {len(output_buffer)}):\n{output_buffer.strip()}")
-        return output_buffer.strip()
-
-    except Exception as e:
-        logger.exception(f"Error executing command '{cmd}'") # Log full traceback
-        raise RuntimeError(f"Failed executing command '{cmd}': {e}") from e
-
-
-def initialize_msf_client():
-    """Initializes the global Metasploit RPC client instance."""
     global _msf_client_instance
     if _msf_client_instance is not None:
         return _msf_client_instance
 
     logger.info("Attempting to initialize Metasploit RPC client...")
 
-    msf_password = os.environ.get('MSF_PASSWORD', 'yourpassword') # Default password
-    msf_server = os.getenv('MSF_SERVER', '127.0.0.1')
-    msf_port_str = os.getenv('MSF_PORT', '55553')
-    msf_ssl_str = os.getenv('MSF_SSL', 'false')
+    try:
+        msf_port = int(MSF_PORT_STR)
+        msf_ssl = MSF_SSL_STR.lower() == 'true'
+    except ValueError as e:
+        logger.error(f"Invalid MSF connection parameters (PORT: {MSF_PORT_STR}, SSL: {MSF_SSL_STR}). Error: {e}")
+        raise ValueError("Invalid MSF connection parameters") from e
 
     try:
-        msf_port = int(msf_port_str)
-        msf_ssl = msf_ssl_str.lower() == 'true'
         client = MsfRpcClient(
-            password=msf_password,
-            server=msf_server,
+            password=MSF_PASSWORD,
+            server=MSF_SERVER,
             port=msf_port,
             ssl=msf_ssl
         )
         # Test connection during initialization
-        version_info = client.core.version # Access as property
-        logger.info(f"Successfully connected to Metasploit RPC at {msf_server}:{msf_port} (SSL: {msf_ssl}), version: {version_info.get('version', 'unknown')}")
+        version_info = client.core.version
+        msf_version = version_info.get('version', 'unknown') if isinstance(version_info, dict) else 'unknown'
+        logger.info(f"Successfully connected to Metasploit RPC at {MSF_SERVER}:{msf_port} (SSL: {msf_ssl}), version: {msf_version}")
         _msf_client_instance = client
         return _msf_client_instance
-    except (ValueError, TypeError) as e:
-        logger.error(f"Invalid MSF connection parameters (PORT: {msf_port_str}, SSL: {msf_ssl_str}). Error: {e}")
-        raise ValueError(f"Invalid MSF connection parameters") from e
     except MsfRpcError as e:
-        logger.error(f"Failed to connect or authenticate to Metasploit RPC ({msf_server}:{msf_port}, SSL: {msf_ssl}): {e}")
+        logger.error(f"Failed to connect or authenticate to Metasploit RPC ({MSF_SERVER}:{msf_port}, SSL: {msf_ssl}): {e}")
         raise ConnectionError(f"Failed to connect/authenticate to Metasploit RPC: {e}") from e
     except Exception as e:
         logger.error(f"An unexpected error occurred during MSF client initialization: {e}", exc_info=True)
         raise RuntimeError(f"Unexpected error initializing MSF client: {e}") from e
 
+def get_msf_client() -> MsfRpcClient:
+    """Gets the initialized MSF client instance, raising an error if not ready."""
+    if _msf_client_instance is None:
+        raise ConnectionError("Metasploit client has not been initialized.") # Strict check preferred
+    return _msf_client_instance
+
 @contextlib.asynccontextmanager
 async def get_msf_console() -> MsfConsole:
-    """Async context manager for creating and destroying an MSF console."""
-    global _msf_client_instance
-    if _msf_client_instance is None:
-        raise ConnectionError("Metasploit client not initialized.")
-
+    """
+    Async context manager for creating and reliably destroying an MSF console.
+    """
+    client = get_msf_client() # Raises ConnectionError if not initialized
     console_object: Optional[MsfConsole] = None
     console_id_str: Optional[str] = None
     try:
-        logger.debug("Attempting to create temporary console...")
+        logger.debug("Creating temporary MSF console...")
         # Create console object directly
-        console_object = await asyncio.to_thread(lambda: _msf_client_instance.consoles.console())
-        # logger.debug(f"Console creation returned type: {type(console_object)}, value: {console_object}")
+        console_object = await asyncio.to_thread(lambda: client.consoles.console())
 
         # Get ID using .cid attribute
         if isinstance(console_object, MsfConsole) and hasattr(console_object, 'cid'):
             console_id_val = getattr(console_object, 'cid')
             console_id_str = str(console_id_val) if console_id_val is not None else None
             if not console_id_str:
-                raise ValueError(".cid attribute is present but empty or None.")
-            logger.info(f"Successfully obtained console object and extracted ID: {console_id_str}")
-            # Read initial prompt/banner to clear buffer (optional but can help)
-            await asyncio.sleep(0.1)
-            initial_read = await asyncio.to_thread(console_object.read)
+                raise ValueError("Console object created, but .cid attribute is empty or None.")
+            logger.info(f"MSF console created (ID: {console_id_str})")
+
+            # Read initial prompt/banner to clear buffer and ensure readiness
+            await asyncio.sleep(0.2) # Short delay for prompt to appear
+            initial_read = await asyncio.to_thread(lambda: console_object.read())
             logger.debug(f"Initial console read (clearing buffer): {initial_read}")
-            yield console_object # Yield the validated console object
+            yield console_object # Yield the ready console object
         else:
             # This case should ideally not happen if .console() works as expected
             logger.error(f"client.consoles.console() did not return expected MsfConsole object with .cid. Got type: {type(console_object)}")
@@ -236,20 +139,440 @@ async def get_msf_console() -> MsfConsole:
         if console_id_str and _msf_client_instance: # Check client still exists
             try:
                 logger.info(f"Attempting to destroy Metasploit console (ID: {console_id_str})...")
+                # Use lambda to avoid potential issues with capture
                 destroy_result = await asyncio.to_thread(
-                    lambda: _msf_client_instance.consoles.destroy(console_id_str)
+                    lambda cid=console_id_str: _msf_client_instance.consoles.destroy(cid)
                 )
                 logger.debug(f"Console destroy result: {destroy_result}")
             except Exception as e:
-                # Log error but don't prevent function exit
+                # Log error but don't raise exception during cleanup
                 logger.error(f"Error destroying MSF console {console_id_str}: {e}")
         elif console_object and not console_id_str:
              logger.warning("Console object created but no valid ID obtained, cannot explicitly destroy.")
         # else: logger.debug("No console ID obtained, skipping destruction.")
 
+async def run_command_safely(console: MsfConsole, cmd: str, execution_timeout: Optional[int] = None) -> str:
+    """
+    Safely run a command on a Metasploit console and return the output.
+    Relies primarily on detecting the MSF prompt for command completion.
+
+    Args:
+        console: The Metasploit console object (MsfConsole).
+        cmd: The command to run.
+        execution_timeout: Optional specific timeout for this command's execution phase.
+
+    Returns:
+        The command output as a string.
+    """
+    if not (hasattr(console, 'write') and hasattr(console, 'read')):
+        logger.error(f"Console object {type(console)} lacks required methods (write, read).")
+        raise TypeError("Unsupported console object type for command execution.")
+
+    try:
+        logger.debug(f"Running console command: {cmd}")
+        await asyncio.to_thread(lambda: console.write(cmd + '\n'))
+
+        output_buffer = b"" # Read as bytes to handle potential encoding issues and prompt matching
+        start_time = asyncio.get_event_loop().time()
+
+        # Determine read timeout - use inactivity timeout as fallback
+        read_timeout = execution_timeout or (LONG_CONSOLE_READ_TIMEOUT if cmd.strip().startswith(("run", "exploit", "check")) else DEFAULT_CONSOLE_READ_TIMEOUT)
+        check_interval = 0.1 # Seconds between reads
+        last_data_time = start_time
+
+        while True:
+            await asyncio.sleep(check_interval)
+            current_time = asyncio.get_event_loop().time()
+
+            # Check overall timeout first
+            if (current_time - start_time) > read_timeout:
+                 logger.warning(f"Overall timeout ({read_timeout}s) reached for console command '{cmd}'.")
+                 break
+
+            # Read available data
+            try:
+                chunk_result = await asyncio.to_thread(lambda: console.read())
+                # console.read() returns {'data': '...', 'prompt': '...', 'busy': bool}
+                chunk_data = chunk_result.get('data', '').encode('utf-8', errors='replace') # Ensure bytes
+
+                # Handle the prompt - ensure it's bytes for pattern matching
+                prompt_str = chunk_result.get('prompt', '')
+                prompt_bytes = prompt_str.encode('utf-8', errors='replace') if isinstance(prompt_str, str) else prompt_str
+            except Exception as read_err:
+                logger.warning(f"Error reading from console during command '{cmd}': {read_err}")
+                await asyncio.sleep(0.5) # Wait a bit before retrying or timing out
+                continue
+
+            if chunk_data:
+                # logger.debug(f"Read chunk (bytes): {chunk_data[:100]}...") # Log sparingly
+                output_buffer += chunk_data
+                last_data_time = current_time # Reset inactivity timer
+
+                # Primary Completion Check: Did we receive the prompt?
+                if prompt_bytes and MSF_PROMPT_RE.search(prompt_bytes):
+                     logger.debug(f"Detected MSF prompt in console.read() result for '{cmd}'. Command likely complete.")
+                     break
+                # Secondary Check: Does the buffered output end with the prompt?
+                # Needed if prompt wasn't in the last read chunk but arrived earlier.
+                if MSF_PROMPT_RE.search(output_buffer):
+                     logger.debug(f"Detected MSF prompt at end of buffer for '{cmd}'. Command likely complete.")
+                     break
+
+            # Fallback Completion Check: Inactivity timeout
+            elif (current_time - last_data_time) > SESSION_READ_INACTIVITY_TIMEOUT: # Use a shorter inactivity timeout here
+                logger.debug(f"Console inactivity timeout ({SESSION_READ_INACTIVITY_TIMEOUT}s) reached for command '{cmd}'. Assuming complete.")
+                break
+
+        # Decode the final buffer
+        final_output = output_buffer.decode('utf-8', errors='replace').strip()
+        logger.debug(f"Final output for '{cmd}' (length {len(final_output)}):\n{final_output[:500]}{'...' if len(final_output) > 500 else ''}")
+        return final_output
+
+    except Exception as e:
+        logger.exception(f"Error executing console command '{cmd}'")
+        raise RuntimeError(f"Failed executing console command '{cmd}': {e}") from e
 
 # --- MCP Server Initialization ---
-mcp = FastMCP("Metasploit Tools Improved")
+mcp = FastMCP("Metasploit Tools Enhanced (Streamlined)")
+
+# --- Internal Helper Functions ---
+
+async def _get_module_object(module_type: str, module_name: str) -> Any:
+    """Gets the MSF module object, handling potential path variations."""
+    client = get_msf_client()
+    base_module_name = module_name # Start assuming it's the base name
+    if '/' in module_name:
+        parts = module_name.split('/')
+        if parts[0] in ('exploit', 'payload', 'post', 'auxiliary', 'encoder', 'nop'):
+             # Looks like full path, extract base name
+             base_module_name = '/'.join(parts[1:])
+             if module_type != parts[0]:
+                 logger.warning(f"Module type mismatch: expected '{module_type}', got path starting with '{parts[0]}'. Using provided type.")
+        # Else: Assume it's like 'windows/smb/ms17_010_eternalblue' - already the base name
+
+    logger.debug(f"Attempting to retrieve module: client.modules.use('{module_type}', '{base_module_name}')")
+    try:
+        module_obj = await asyncio.to_thread(lambda: client.modules.use(module_type, base_module_name))
+        logger.debug(f"Successfully retrieved module object for {module_type}/{base_module_name}")
+        return module_obj
+    except (MsfRpcError, KeyError) as e:
+        # KeyError can be raised by pymetasploit3 if module not found
+        error_str = str(e).lower()
+        if "unknown module" in error_str or "invalid module" in error_str or isinstance(e, KeyError):
+             logger.error(f"Module {module_type}/{base_module_name} (from input {module_name}) not found.")
+             raise ValueError(f"Module '{module_name}' of type '{module_type}' not found.") from e
+        else:
+             logger.error(f"MsfRpcError getting module {module_type}/{base_module_name}: {e}")
+             raise MsfRpcError(f"Error retrieving module '{module_name}': {e}") from e
+
+async def _set_module_options(module_obj: Any, options: Dict[str, Any]):
+    """Sets options on a module object, performing basic type guessing."""
+    logger.debug(f"Setting options for module {getattr(module_obj, 'fullname', '')}: {options}")
+    for k, v in options.items():
+        # Basic type guessing
+        original_value = v
+        if isinstance(v, str):
+            if v.isdigit():
+                try: v = int(v)
+                except ValueError: pass # Keep as string if large number or non-integer
+            elif v.lower() in ('true', 'false'):
+                v = v.lower() == 'true'
+            # Add more specific checks if needed (e.g., for file paths)
+        elif isinstance(v, (int, bool)):
+            pass # Already correct type
+        # Add handling for other types like lists if necessary
+
+        try:
+            # Use lambda to capture current k, v for the thread
+            await asyncio.to_thread(lambda key=k, value=v: module_obj.__setitem__(key, value))
+            # logger.debug(f"Set option {k}={v} (original: {original_value})")
+        except (MsfRpcError, KeyError, TypeError) as e:
+             # Catch potential errors if option doesn't exist or type is wrong
+             logger.error(f"Failed to set option {k}={v} on module: {e}")
+             raise ValueError(f"Failed to set option '{k}' to '{original_value}': {e}") from e
+
+async def _execute_module_rpc(
+    module_type: str,
+    module_name: str, # Can be full path or base name
+    module_options: Dict[str, Any],
+    payload_spec: Optional[Union[str, Dict[str, Any]]] = None # Payload name or {name: ..., options: ...}
+) -> Dict[str, Any]:
+    """
+    Helper to execute an exploit, auxiliary, or post module as a background job via RPC.
+    Includes polling logic for exploit sessions.
+    """
+    client = get_msf_client()
+    module_obj = await _get_module_object(module_type, module_name) # Handles path variants
+    full_module_path = getattr(module_obj, 'fullname', f"{module_type}/{module_name}") # Get canonical name
+
+    await _set_module_options(module_obj, module_options)
+
+    payload_obj_to_pass = None
+    payload_name_for_log = None
+    payload_options_for_log = None
+
+    # Prepare payload if needed (primarily for exploits, also used by start_listener)
+    if module_type == 'exploit' and payload_spec:
+        if isinstance(payload_spec, str):
+             payload_name_for_log = payload_spec
+             # Passing name string directly is supported by exploit.execute
+             payload_obj_to_pass = payload_name_for_log
+             logger.info(f"Executing {full_module_path} with payload '{payload_name_for_log}' (passed as string).")
+        elif isinstance(payload_spec, dict) and 'name' in payload_spec:
+             payload_name = payload_spec['name']
+             payload_options = payload_spec.get('options', {})
+             payload_name_for_log = payload_name
+             payload_options_for_log = payload_options
+             try:
+                 payload_obj = await _get_module_object('payload', payload_name)
+                 await _set_module_options(payload_obj, payload_options)
+                 payload_obj_to_pass = payload_obj # Pass the configured payload object
+                 logger.info(f"Executing {full_module_path} with configured payload object for '{payload_name}'.")
+             except (ValueError, MsfRpcError) as e:
+                 logger.error(f"Failed to prepare payload object for '{payload_name}': {e}")
+                 return {"status": "error", "message": f"Failed to prepare payload '{payload_name}': {e}"}
+        else:
+             logger.warning(f"Invalid payload_spec format: {payload_spec}. Expected string or dict with 'name'.")
+             return {"status": "error", "message": "Invalid payload specification format."}
+
+    logger.info(f"Executing module {full_module_path} as background job via RPC...")
+    try:
+        if module_type == 'exploit':
+            exec_result = await asyncio.to_thread(lambda: module_obj.execute(payload=payload_obj_to_pass))
+        else: # auxiliary, post
+            exec_result = await asyncio.to_thread(lambda: module_obj.execute())
+
+        logger.info(f"RPC execute() result for {full_module_path}: {exec_result}")
+
+        # --- Process Execution Result ---
+        if not isinstance(exec_result, dict):
+            logger.error(f"Unexpected result type from {module_type} execution: {type(exec_result)} - {exec_result}")
+            return {"status": "error", "message": f"Unexpected result from module execution: {exec_result}", "module": full_module_path}
+
+        if exec_result.get('error', False):
+            error_msg = exec_result.get('error_message', exec_result.get('error_string', 'Unknown RPC error during execution'))
+            logger.error(f"Failed to start job for {full_module_path}: {error_msg}")
+            # Check for common errors
+            if "could not bind" in error_msg.lower():
+                return {"status": "error", "message": f"Job start failed: Address/Port likely already in use. {error_msg}", "module": full_module_path}
+            return {"status": "error", "message": f"Failed to start job: {error_msg}", "module": full_module_path}
+
+        job_id = exec_result.get('job_id')
+        uuid = exec_result.get('uuid')
+
+        if job_id is None:
+            logger.warning(f"{module_type.capitalize()} job executed but no job_id returned: {exec_result}")
+            # Sometimes handlers don't return job_id but are running, check by UUID/name later maybe
+            if module_type == 'exploit' and 'handler' in full_module_path:
+                 # Check jobs list for a match based on payload/lhost/lport
+                 await asyncio.sleep(1.0)
+                 jobs_list = await asyncio.to_thread(lambda: client.jobs.list)
+                 for jid, jinfo in jobs_list.items():
+                     if isinstance(jinfo, dict) and jinfo.get('name','').endswith('Handler') and \
+                        jinfo.get('datastore',{}).get('LHOST') == module_options.get('LHOST') and \
+                        jinfo.get('datastore',{}).get('LPORT') == module_options.get('LPORT') and \
+                        jinfo.get('datastore',{}).get('PAYLOAD') == payload_name_for_log:
+                          logger.info(f"Found probable handler job {jid} matching parameters.")
+                          return {"status": "success", "message": f"Listener likely started as job {jid}", "job_id": jid, "uuid": uuid, "module": full_module_path}
+
+            return {"status": "unknown", "message": f"{module_type.capitalize()} executed, but no job ID returned.", "result": exec_result, "module": full_module_path}
+
+        # --- Exploit Specific: Poll for Session ---
+        found_session_id = None
+        if module_type == 'exploit' and uuid:
+             start_time = asyncio.get_event_loop().time()
+             logger.info(f"Exploit job {job_id} (UUID: {uuid}) started. Polling for session (timeout: {EXPLOIT_SESSION_POLL_TIMEOUT}s)...")
+             while (asyncio.get_event_loop().time() - start_time) < EXPLOIT_SESSION_POLL_TIMEOUT:
+                 try:
+                     sessions_list = await asyncio.to_thread(lambda: client.sessions.list)
+                     for s_id, s_info in sessions_list.items():
+                         # Ensure comparison is robust (uuid might be str or bytes, info dict keys too)
+                         s_id_str = str(s_id)
+                         if isinstance(s_info, dict) and str(s_info.get('exploit_uuid')) == str(uuid):
+                             found_session_id = s_id # Keep original type from list keys
+                             logger.info(f"Found matching session {found_session_id} for job {job_id} (UUID: {uuid})")
+                             break # Exit inner loop
+
+                     if found_session_id is not None: break # Exit outer loop
+
+                     # Optional: Check if job died prematurely
+                     # job_info = await asyncio.to_thread(lambda: client.jobs.info(str(job_id)))
+                     # if not job_info or job_info.get('status') != 'running':
+                     #     logger.warning(f"Job {job_id} stopped or disappeared during session polling.")
+                     #     break
+
+                 except MsfRpcError as poll_e: logger.warning(f"Error during session polling: {poll_e}")
+                 except Exception as poll_e: logger.error(f"Unexpected error during polling: {poll_e}", exc_info=True); break
+
+                 await asyncio.sleep(EXPLOIT_SESSION_POLL_INTERVAL)
+
+             if found_session_id is None:
+                 logger.warning(f"Polling timeout ({EXPLOIT_SESSION_POLL_TIMEOUT}s) reached for job {job_id}, no matching session found.")
+
+        # --- Construct Final Success/Warning Message ---
+        message = f"{module_type.capitalize()} module {full_module_path} started as job {job_id}."
+        status = "success"
+        if module_type == 'exploit':
+            if found_session_id is not None:
+                 message += f" Session {found_session_id} created."
+            else:
+                 message += " No session detected within timeout."
+                 status = "warning" # Indicate job started but session didn't appear
+
+        return {
+            "status": status, "message": message, "job_id": job_id, "uuid": uuid,
+            "session_id": found_session_id, # None if not found/not applicable
+            "module": full_module_path, "options": module_options,
+            "payload_name": payload_name_for_log, # Include payload info if exploit
+            "payload_options": payload_options_for_log
+        }
+
+    except (MsfRpcError, ValueError) as e: # Catch module prep errors too
+        error_str = str(e).lower()
+        logger.error(f"Error executing module {full_module_path} via RPC: {e}")
+        if "missing required option" in error_str or "invalid option" in error_str:
+             missing = getattr(module_obj, 'missing_required', [])
+             return {"status": "error", "message": f"Missing/invalid options for {full_module_path}: {e}", "missing_required": missing}
+        elif "invalid payload" in error_str:
+             return {"status": "error", "message": f"Invalid payload specified: {payload_name_for_log or 'None'}. {e}"}
+        return {"status": "error", "message": f"Error running {full_module_path}: {e}"}
+    except Exception as e:
+        logger.exception(f"Unexpected error executing module {full_module_path} via RPC")
+        return {"status": "error", "message": f"Unexpected server error running {full_module_path}: {e}"}
+
+async def _execute_module_console(
+    module_type: str,
+    module_name: str, # Can be full path or base name
+    module_options: Dict[str, Any],
+    command: str, # Typically 'exploit', 'run', or 'check'
+    payload_spec: Optional[Union[str, Dict[str, Any]]] = None,
+    timeout: int = LONG_CONSOLE_READ_TIMEOUT
+) -> Dict[str, Any]:
+    """Helper to execute a module synchronously via console."""
+    # Determine full path needed for 'use' command
+    if '/' not in module_name:
+         full_module_path = f"{module_type}/{module_name}"
+    else:
+         # Assume full path or relative path was given; ensure type prefix
+         if not module_name.startswith(module_type + '/'):
+             # e.g., got 'windows/x', type 'exploit' -> 'exploit/windows/x'
+             # e.g., got 'exploit/windows/x', type 'exploit' -> 'exploit/windows/x' (no change)
+             if not any(module_name.startswith(pfx + '/') for pfx in ['exploit', 'payload', 'post', 'auxiliary', 'encoder', 'nop']):
+                  full_module_path = f"{module_type}/{module_name}"
+             else: # Already has a type prefix, use it as is
+                   full_module_path = module_name
+         else: # Starts with correct type prefix
+             full_module_path = module_name
+
+    logger.info(f"Executing {full_module_path} synchronously via console (command: {command})...")
+
+    payload_name_for_log = None
+    payload_options_for_log = None
+
+    async with get_msf_console() as console:
+        try:
+            setup_commands = [f"use {full_module_path}"]
+
+            # Add module options
+            for key, value in module_options.items():
+                val_str = str(value)
+                if isinstance(value, str) and any(c in val_str for c in [' ', '"', "'", '\\']):
+                    val_str = shlex.quote(val_str)
+                elif isinstance(value, bool):
+                    val_str = str(value).lower() # MSF console expects lowercase bools
+                setup_commands.append(f"set {key} {val_str}")
+
+            # Add payload and payload options (if applicable)
+            if payload_spec:
+                payload_name = None
+                payload_options = {}
+                if isinstance(payload_spec, str):
+                    payload_name = payload_spec
+                elif isinstance(payload_spec, dict) and 'name' in payload_spec:
+                    payload_name = payload_spec['name']
+                    payload_options = payload_spec.get('options', {})
+
+                if payload_name:
+                    payload_name_for_log = payload_name
+                    payload_options_for_log = payload_options
+                    # Need base name for 'set PAYLOAD'
+                    if '/' in payload_name:
+                        parts = payload_name.split('/')
+                        if parts[0] == 'payload': payload_base_name = '/'.join(parts[1:])
+                        else: payload_base_name = payload_name # Assume relative
+                    else: payload_base_name = payload_name # Assume just name
+
+                    setup_commands.append(f"set PAYLOAD {payload_base_name}")
+                    for key, value in payload_options.items():
+                        val_str = str(value)
+                        if isinstance(value, str) and any(c in val_str for c in [' ', '"', "'", '\\']):
+                            val_str = shlex.quote(val_str)
+                        elif isinstance(value, bool):
+                            val_str = str(value).lower()
+                        setup_commands.append(f"set {key} {val_str}")
+
+            # Execute setup commands
+            for cmd in setup_commands:
+                setup_output = await run_command_safely(console, cmd, execution_timeout=DEFAULT_CONSOLE_READ_TIMEOUT)
+                # Basic error check in setup output
+                if any(err in setup_output for err in ["[-] Error setting", "Invalid option", "Unknown module", "Failed to load"]):
+                    error_msg = f"Error during setup command '{cmd}': {setup_output}"
+                    logger.error(error_msg)
+                    return {"status": "error", "message": error_msg, "module": full_module_path}
+                await asyncio.sleep(0.1) # Small delay between setup commands
+
+            # Execute the final command (exploit, run, check)
+            logger.info(f"Running final console command: {command}")
+            module_output = await run_command_safely(console, command, execution_timeout=timeout)
+            logger.debug(f"Synchronous execution output length: {len(module_output)}")
+
+            # --- Parse Console Output ---
+            session_id = None
+            session_opened_line = ""
+            # More robust session detection pattern
+            session_match = re.search(r"(?:meterpreter|command shell)\s+session\s+(\d+)\s+opened", module_output, re.IGNORECASE)
+            if session_match:
+                 try:
+                     session_id = int(session_match.group(1))
+                     session_opened_line = session_match.group(0) # The matched line segment
+                     logger.info(f"Detected session {session_id} opened in console output.")
+                 except (ValueError, IndexError):
+                     logger.warning("Found session opened pattern, but failed to parse ID.")
+
+            status = "success"
+            message = f"{module_type.capitalize()} module {full_module_path} completed via console ({command})."
+            if command in ['exploit', 'run'] and session_id is None and \
+               any(term in module_output.lower() for term in ['session opened', 'sending stage']):
+                 message += " Session may have opened but ID detection failed or session closed quickly."
+                 status = "warning"
+            elif command in ['exploit', 'run'] and session_id is not None:
+                 message += f" Session {session_id} detected."
+
+            # Check for common failure indicators
+            if any(fail in module_output.lower() for fail in ['exploit completed, but no session was created', 'exploit failed', 'run failed', 'check failed', 'module check failed']):
+                 status = "error" if status != "warning" else status # Don't override warning if session might have opened
+                 message = f"{module_type.capitalize()} module {full_module_path} execution via console appears to have failed. Check output."
+                 logger.error(f"Failure detected in console output for {full_module_path}.")
+
+
+            return {
+                 "status": status,
+                 "message": message,
+                 "module_output": module_output,
+                 "session_id_detected": session_id,
+                 "session_opened_line": session_opened_line,
+                 "module": full_module_path,
+                 "options": module_options,
+                 "payload_name": payload_name_for_log,
+                 "payload_options": payload_options_for_log
+            }
+
+        except (RuntimeError, MsfRpcError, ValueError) as e: # Catch errors from run_command_safely or setup
+            logger.error(f"Error during console execution of {full_module_path}: {e}")
+            return {"status": "error", "message": f"Error executing {full_module_path} via console: {e}"}
+        except Exception as e:
+            logger.exception(f"Unexpected error during console execution of {full_module_path}")
+            return {"status": "error", "message": f"Unexpected server error running {full_module_path} via console: {e}"}
 
 # --- MCP Tool Definitions ---
 
@@ -257,19 +580,21 @@ mcp = FastMCP("Metasploit Tools Improved")
 async def list_exploits(search_term: str = "") -> List[str]:
     """
     List available Metasploit exploits, optionally filtered by search term.
+
     Args:
-        search_term: Optional term to filter exploits.
+        search_term: Optional term to filter exploits (case-insensitive).
+
     Returns:
-        List of exploit names matching the search term (max 200 if filtered, 100 otherwise).
+        List of exploit names matching the term (max 200), or top 100 if no term.
     """
-    global _msf_client_instance
-    if _msf_client_instance is None: return ["Error: MSF client not initialized."]
+    client = get_msf_client()
     logger.info(f"Listing exploits (search term: '{search_term or 'None'}')")
     try:
-        exploits = await asyncio.to_thread(lambda: _msf_client_instance.modules.exploits)
+        exploits = await asyncio.to_thread(lambda: client.modules.exploits)
         logger.debug(f"Retrieved {len(exploits)} total exploits from MSF.")
         if search_term:
-            filtered_exploits = [e for e in exploits if search_term.lower() in e.lower()]
+            term_lower = search_term.lower()
+            filtered_exploits = [e for e in exploits if term_lower in e.lower()]
             count = len(filtered_exploits)
             limit = 200
             logger.info(f"Found {count} exploits matching '{search_term}'. Returning max {limit}.")
@@ -280,54 +605,54 @@ async def list_exploits(search_term: str = "") -> List[str]:
             return exploits[:limit]
     except MsfRpcError as e:
         logger.error(f"Failed to list exploits from Metasploit: {e}")
-        return [f"Error listing exploits: {e}"]
+        return [f"Error: Failed to list exploits: {e}"]
     except Exception as e:
         logger.exception("Unexpected error listing exploits.")
-        return [f"Unexpected error listing exploits: {e}"]
+        return [f"Error: Unexpected error listing exploits: {e}"]
 
 @mcp.tool()
 async def list_payloads(platform: str = "", arch: str = "") -> List[str]:
     """
     List available Metasploit payloads, optionally filtered by platform and/or architecture.
+
     Args:
-        platform: Optional platform filter (e.g., 'windows', 'linux', 'python').
-        arch: Optional architecture filter (e.g., 'x86', 'x64', 'cmd').
+        platform: Optional platform filter (e.g., 'windows', 'linux', 'python', 'php').
+        arch: Optional architecture filter (e.g., 'x86', 'x64', 'cmd', 'meterpreter').
+
     Returns:
         List of payload names matching filters (max 100).
     """
-    global _msf_client_instance
-    if _msf_client_instance is None: return ["Error: MSF client not initialized."]
+    client = get_msf_client()
     logger.info(f"Listing payloads (platform: '{platform or 'Any'}', arch: '{arch or 'Any'}')")
     try:
-        payloads = await asyncio.to_thread(lambda: _msf_client_instance.modules.payloads)
+        payloads = await asyncio.to_thread(lambda: client.modules.payloads)
         logger.debug(f"Retrieved {len(payloads)} total payloads from MSF.")
         filtered = payloads
         if platform:
-            # Match platform at the start of the payload path segment
-            filtered = [p for p in filtered if p.lower().startswith(platform.lower() + '/')]
+            plat_lower = platform.lower()
+            # Match platform at the start of the payload path segment or within common paths
+            filtered = [p for p in filtered if p.lower().startswith(plat_lower + '/') or f"/{plat_lower}/" in p.lower()]
         if arch:
-            # Match architecture anywhere in the payload path (e.g., windows/x64/...)
-            filtered = [p for p in filtered if f"/{arch.lower()}/" in p.lower() or p.lower().startswith(arch.lower() + '/')]
+            arch_lower = arch.lower()
+            # Match architecture more flexibly (e.g., '/x64/', 'meterpreter')
+            filtered = [p for p in filtered if f"/{arch_lower}/" in p.lower() or arch_lower in p.lower().split('/')]
+
         count = len(filtered)
         limit = 100
         logger.info(f"Found {count} payloads matching filters. Returning max {limit}.")
         return filtered[:limit]
     except MsfRpcError as e:
         logger.error(f"Failed to list payloads from Metasploit: {e}")
-        return [f"Error listing payloads: {e}"]
+        return [f"Error: Failed to list payloads: {e}"]
     except Exception as e:
         logger.exception("Unexpected error listing payloads.")
-        return [f"Unexpected error listing payloads: {e}"]
+        return [f"Error: Unexpected error listing payloads: {e}"]
 
-
-# --- Rewritten Payload Generation Tool ---
 @mcp.tool()
 async def generate_payload(
     payload_type: str,
     format_type: str,
-    options: Dict[str, Any] = None, # e.g., {"LHOST": "1.2.3.4", "LPORT": 4444}
-    # Removed direct lhost/lport, pass them in options dict
-    # Added encoder options etc.
+    options: Dict[str, Any], # Required: e.g., {"LHOST": "1.2.3.4", "LPORT": 4444}
     encoder: Optional[str] = None,
     iterations: int = 0,
     bad_chars: str = "",
@@ -338,13 +663,13 @@ async def generate_payload(
     output_filename: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Generate a Metasploit payload using the RPC API (payload.payload_generate).
-    Saves the generated payload to a file on the server if generation is successful.
+    Generate a Metasploit payload using the RPC API (payload.generate).
+    Saves the generated payload to a file on the server if successful.
 
     Args:
         payload_type: Type of payload (e.g., windows/meterpreter/reverse_tcp).
         format_type: Output format (raw, exe, python, etc.).
-        options: Dictionary of required payload options (e.g., LHOST, LPORT).
+        options: Dictionary of required payload options (e.g., LHOST, LPORT). MUST be provided.
         encoder: Optional encoder to use.
         iterations: Optional number of encoding iterations.
         bad_chars: Optional string of bad characters to avoid (e.g., '\\x00\\x0a\\x0d').
@@ -355,421 +680,192 @@ async def generate_payload(
         output_filename: Optional desired filename (without path). If None, a default name is generated.
 
     Returns:
-        Dictionary containing status, message, payload size/info,
-        and potentially the server-side path where the payload was saved.
+        Dictionary containing status, message, payload size/info, and server-side save path.
     """
-    global _msf_client_instance
-    if _msf_client_instance is None: return {"status": "error", "message": "MSF client not initialized."}
-
+    client = get_msf_client()
     logger.info(f"Generating payload '{payload_type}' (Format: {format_type}) via RPC. Options: {options}")
-    payload_options = options or {}
+
+    if not options:
+        return {"status": "error", "message": "Payload 'options' dictionary (e.g., LHOST, LPORT) is required."}
 
     try:
         # Get the payload module object
-        payload = await asyncio.to_thread(lambda: _msf_client_instance.modules.use('payload', payload_type))
-        logger.debug(f"Retrieved payload module object for '{payload_type}'")
+        payload = await _get_module_object('payload', payload_type)
 
         # Set payload-specific required options (like LHOST/LPORT)
-        for key, value in payload_options.items():
-             # Basic type guessing (can be refined if needed)
-            if isinstance(value, str):
-                if value.isdigit(): value = int(value)
-                elif value.lower() in ('true', 'false'): value = value.lower() == 'true'
-            await asyncio.to_thread(lambda k=key, v=value: payload.__setitem__(k, v))
-            logger.debug(f"Set payload option {key}={value}")
+        await _set_module_options(payload, options)
 
-        # Set generation options using payload.runoptions - FIXED: Set individual dictionary entries
-        if format_type:
-            await asyncio.to_thread(lambda: payload.runoptions.__setitem__('Format', format_type))
-        if encoder:
-            await asyncio.to_thread(lambda: payload.runoptions.__setitem__('Encoder', encoder))
-        if iterations > 0:
-            await asyncio.to_thread(lambda: payload.runoptions.__setitem__('Iterations', iterations))
-        if bad_chars:
-            await asyncio.to_thread(lambda: payload.runoptions.__setitem__('BadChars', bad_chars))
-        if nop_sled_size > 0:
-            await asyncio.to_thread(lambda: payload.runoptions.__setitem__('NopSledSize', nop_sled_size))
-        if template_path:
-            await asyncio.to_thread(lambda: payload.runoptions.__setitem__('Template', template_path))
-        if keep_template:
-            await asyncio.to_thread(lambda: payload.runoptions.__setitem__('KeepTemplateWorking', True))
-        if force_encode:
-            await asyncio.to_thread(lambda: payload.runoptions.__setitem__('ForceEncode', True))
+        # Prepare generation options dictionary for payload.generate()
+        gen_opts = {
+            'Format': format_type,
+            'Encoder': encoder,
+            'Iterations': iterations,
+            'BadChars': bad_chars,
+            'NopSledSize': nop_sled_size,
+            'Template': template_path,
+            'KeepTemplateWorking': keep_template,
+            'ForceEncode': force_encode,
+        }
+        # Filter out None/empty/default values to avoid passing unnecessary options
+        gen_opts_filtered = {k: v for k, v in gen_opts.items() if v is not None and v != '' and v != 0 and v is not False}
+        logger.debug(f"Payload generation options: {gen_opts_filtered}")
 
-        logger.debug(f"Set payload generation options in runoptions dictionary")
+        # Generate the payload bytes using payload.generate()
+        logger.info("Calling payload.generate()...")
+        # payload.generate() takes the options dict as an argument
+        raw_payload_bytes = await asyncio.to_thread(lambda: payload.generate(gen_opts_filtered))
 
-        # Generate the payload bytes
-        logger.info("Calling payload_generate()...")
-        raw_payload_bytes = await asyncio.to_thread(payload.payload_generate) # Expects bytes
+        if not isinstance(raw_payload_bytes, bytes):
+            error_msg = f"Payload generation failed. Expected bytes, got {type(raw_payload_bytes)}: {str(raw_payload_bytes)[:200]}"
+            logger.error(error_msg)
+            # Try to extract specific error from potential dictionary response
+            if isinstance(raw_payload_bytes, dict) and raw_payload_bytes.get('error'):
+                 error_msg = raw_payload_bytes.get('error_message', str(raw_payload_bytes))
+            return {"status": "error", "message": f"Payload generation failed: {error_msg}"}
 
-        if isinstance(raw_payload_bytes, bytes):
-            payload_size = len(raw_payload_bytes)
-            logger.info(f"Payload generation successful. Size: {payload_size} bytes.")
-            
-            # Determine save directory
-            save_directory = os.environ.get('PAYLOAD_SAVE_DIR')
-            if not save_directory:
-                # Default to ~/payloads
-                save_directory = str(pathlib.Path.home() / "payloads")
-            
-            # Ensure directory exists
-            try:
-                os.makedirs(save_directory, exist_ok=True)
-                logger.debug(f"Ensuring payload directory exists: {save_directory}")
-            except OSError as e:
-                logger.error(f"Failed to create payload save directory {save_directory}: {e}")
-                return {
-                    "status": "error", 
-                    "message": f"Payload generated successfully ({payload_size} bytes) but could not create save directory: {e}",
-                    "payload_size": payload_size, 
-                    "format": format_type
-                }
-            
-            # Determine filename
-            final_filename = None
-            if output_filename:
-                # Basic sanitization - allow only alphanumeric, underscore, hyphen, dot
-                import re
-                sanitized = re.sub(r'[^a-zA-Z0-9_\-.]', '_', output_filename)
-                if sanitized:
-                    final_filename = sanitized
-            
-            if not final_filename:
-                # Create default filename
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                safe_payload_type = payload_type.replace('/', '_')
-                final_filename = f"payload_{safe_payload_type}_{timestamp}.{format_type}"
-            
-            # Full save path
-            save_path = os.path.join(save_directory, final_filename)
-            
-            # Write payload to file
-            try:
-                with open(save_path, "wb") as f:
-                    f.write(raw_payload_bytes)
-                logger.info(f"Payload saved to {save_path}")
-                return {
-                    "status": "success", 
-                    "message": f"Payload '{payload_type}' generated successfully and saved.", 
-                    "payload_size": payload_size, 
-                    "format": format_type,
-                    "server_save_path": save_path
-                }
-            except IOError as e:
-                logger.error(f"Failed to write payload to {save_path}: {e}")
-                return {
-                    "status": "error", 
-                    "message": f"Payload generated but failed to save to file: {e}", 
-                    "payload_size": payload_size, 
-                    "format": format_type
-                }
+        payload_size = len(raw_payload_bytes)
+        logger.info(f"Payload generation successful. Size: {payload_size} bytes.")
 
-        elif isinstance(raw_payload_bytes, str): # Should return bytes, but handle error strings
-             logger.error(f"Payload generation failed. payload_generate returned string: {raw_payload_bytes}")
-             return {"status": "error", "message": f"Payload generation failed: {raw_payload_bytes}"}
-        else:
-            logger.error(f"Payload generation failed. Unexpected return type: {type(raw_payload_bytes)}")
-            return {"status": "error", "message": "Payload generation failed. Unexpected return type from API."}
+        # --- Save Payload ---
+        # Ensure directory exists
+        try:
+            os.makedirs(PAYLOAD_SAVE_DIR, exist_ok=True)
+            logger.debug(f"Ensured payload directory exists: {PAYLOAD_SAVE_DIR}")
+        except OSError as e:
+            logger.error(f"Failed to create payload save directory {PAYLOAD_SAVE_DIR}: {e}")
+            return {
+                "status": "error",
+                "message": f"Payload generated ({payload_size} bytes) but could not create save directory: {e}",
+                "payload_size": payload_size, "format": format_type
+            }
 
-    except MsfRpcError as e:
-        if "Invalid Payload" in str(e):
-            logger.error(f"Invalid payload type specified: {payload_type}")
-            return {"status": "error", "message": f"Invalid payload type: {payload_type}"}
-        elif "Missing required" in str(e) or "Invalid option" in str(e):
-             logger.error(f"Missing or invalid options for payload {payload_type}: {e}")
-             return {"status": "error", "message": f"Missing/invalid options for payload {payload_type}: {str(e)}", "required_options": getattr(payload, 'missing_required', [])}
-        logger.error(f"MsfRpcError generating payload {payload_type}: {e}")
-        return {"status": "error", "message": f"Error generating payload: {str(e)}"}
+        # Determine filename (with basic sanitization)
+        final_filename = None
+        if output_filename:
+            sanitized = re.sub(r'[^a-zA-Z0-9_.\-]', '_', os.path.basename(output_filename)) # Basic sanitize + basename
+            if sanitized: final_filename = sanitized
+
+        if not final_filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_payload_type = re.sub(r'[^a-zA-Z0-9_]', '_', payload_type)
+            safe_format = re.sub(r'[^a-zA-Z0-9_]', '_', format_type)
+            final_filename = f"payload_{safe_payload_type}_{timestamp}.{safe_format}"
+
+        save_path = os.path.join(PAYLOAD_SAVE_DIR, final_filename)
+
+        # Write payload to file
+        try:
+            with open(save_path, "wb") as f:
+                f.write(raw_payload_bytes)
+            logger.info(f"Payload saved to {save_path}")
+            return {
+                "status": "success",
+                "message": f"Payload '{payload_type}' generated successfully and saved.",
+                "payload_size": payload_size,
+                "format": format_type,
+                "server_save_path": save_path
+            }
+        except IOError as e:
+            logger.error(f"Failed to write payload to {save_path}: {e}")
+            return {
+                "status": "error",
+                "message": f"Payload generated but failed to save to file: {e}",
+                "payload_size": payload_size, "format": format_type
+            }
+
+    except (ValueError, MsfRpcError) as e: # Catches errors from _get_module_object, _set_module_options, or generate
+        error_str = str(e).lower()
+        logger.error(f"Error generating payload {payload_type}: {e}")
+        if "invalid payload type" in error_str or "unknown module" in error_str:
+             return {"status": "error", "message": f"Invalid payload type: {payload_type}"}
+        elif "missing required option" in error_str or "invalid option" in error_str:
+             missing = getattr(payload, 'missing_required', []) if 'payload' in locals() else []
+             return {"status": "error", "message": f"Missing/invalid options for payload {payload_type}: {e}", "missing_required": missing}
+        return {"status": "error", "message": f"Error generating payload: {e}"}
     except Exception as e:
         logger.exception(f"Unexpected error during payload generation for '{payload_type}'.")
-        return {"status": "error", "message": "An unexpected error occurred during payload generation.", "error_details": str(e)}
+        return {"status": "error", "message": f"An unexpected server error occurred during payload generation: {e}"}
 
 @mcp.tool()
 async def run_exploit(
     module_name: str,
     options: Dict[str, Any],
-    payload_name: Optional[str] = None, # Renamed for clarity
+    payload_name: Optional[str] = None,
     payload_options: Optional[Dict[str, Any]] = None,
-    run_as_job: bool = True, # Defaulting to True for exploits seems safer
-    timeout_seconds: int = 300
+    run_as_job: bool = True,
+    check_vulnerability: bool = False, # New option
+    timeout_seconds: int = LONG_CONSOLE_READ_TIMEOUT # Used only if run_as_job=False
 ) -> Dict[str, Any]:
     """
-    Run a Metasploit exploit module with specified options.
-    Handles both synchronous (run_as_job=False) and asynchronous (run_as_job=True) execution.
-    Uses the payload object passing method for asynchronous runs if payload_options are set.
+    Run a Metasploit exploit module with specified options. Handles async (job)
+    and sync (console) execution, and includes session polling for jobs.
 
     Args:
-        module_name: Name of the exploit module (e.g., 'unix/ftp/vsftpd_234_backdoor' or 'exploit/unix/ftp/vsftpd_234_backdoor').
+        module_name: Name/path of the exploit module (e.g., 'unix/ftp/vsftpd_234_backdoor').
         options: Dictionary of exploit module options (e.g., {'RHOSTS': '192.168.1.1'}).
-        payload_name: Name of the payload to use (e.g., 'windows/meterpreter/reverse_tcp').
-        payload_options: Dictionary of payload options (e.g., {'LHOST': '192.168.1.100', 'LPORT': 4444}).
-        run_as_job: If True, run as background job. If False, run synchronously.
+        payload_name: Name of the payload (e.g., 'linux/x86/meterpreter/reverse_tcp').
+        payload_options: Dictionary of payload options (e.g., {'LHOST': '...', 'LPORT': ...}).
+        run_as_job: If True (default), run async via RPC. If False, run sync via console.
+        check_vulnerability: If True, run module's 'check' action first (if available).
         timeout_seconds: Max time for synchronous run via console.
 
     Returns:
-        Dictionary with execution results or error details.
+        Dictionary with execution results (job_id, session_id, output) or error details.
     """
-    global _msf_client_instance
-    if _msf_client_instance is None: return {"status": "error", "message": "MSF client not initialized."}
+    logger.info(f"Request to run exploit '{module_name}'. Job: {run_as_job}, Check: {check_vulnerability}, Payload: {payload_name}")
 
-    logger.info(f"Running exploit '{module_name}'. Run as job: {run_as_job}. Options: {options}, Payload: {payload_name}, Payload Opts: {payload_options}")
+    payload_spec = None
+    if payload_name:
+        payload_spec = {"name": payload_name, "options": payload_options or {}}
 
-    # --- Determine full and base module names ---
-    if module_name.startswith('exploit/'):
-        full_module_path = module_name
-        base_module_name = module_name.split('/', 1)[1] if len(module_name.split('/', 1)) > 1 else ""
-    elif '/' in module_name: # Assume it's a relative path like 'unix/ftp/...'
-        full_module_path = f"exploit/{module_name}"
-        base_module_name = module_name
+    if check_vulnerability:
+        logger.info(f"Performing vulnerability check first for {module_name}...")
+        try:
+             # Use the console helper for 'check' as it provides output
+             check_result = await _execute_module_console(
+                 module_type='exploit',
+                 module_name=module_name,
+                 module_options=options,
+                 command='check', # Use the 'check' command
+                 timeout=timeout_seconds
+             )
+             logger.info(f"Vulnerability check result: {check_result.get('status')} - {check_result.get('message')}")
+             output = check_result.get("module_output", "").lower()
+             # Check output for positive indicators
+             is_vulnerable = "appears vulnerable" in output or "is vulnerable" in output or "+ vulnerable" in output
+             # Check for negative indicators (more reliable sometimes)
+             is_not_vulnerable = "does not appear vulnerable" in output or "is not vulnerable" in output or "target is not vulnerable" in output or "check failed" in output
+
+             if is_not_vulnerable or (not is_vulnerable and check_result.get("status") == "error"):
+                 logger.warning(f"Check indicates target is likely not vulnerable to {module_name}.")
+                 return {"status": "aborted", "message": f"Check indicates target not vulnerable. Exploit not attempted.", "check_output": check_result.get("module_output")}
+             elif not is_vulnerable:
+                 logger.warning(f"Check result inconclusive for {module_name}. Proceeding with exploit attempt cautiously.")
+             else:
+                 logger.info(f"Check indicates target appears vulnerable to {module_name}. Proceeding.")
+             # Optionally return check output here if needed by the agent
+
+        except Exception as chk_e:
+             logger.warning(f"Vulnerability check failed for {module_name}: {chk_e}. Proceeding with exploit attempt.")
+             # Fall through to exploit attempt
+
+    # Execute the exploit
+    if run_as_job:
+        return await _execute_module_rpc(
+            module_type='exploit',
+            module_name=module_name,
+            module_options=options,
+            payload_spec=payload_spec
+        )
     else:
-        # Handle cases where only the final part might be provided, although less common for exploits
-        logger.error(f"Ambiguous exploit module format: '{module_name}'. Please provide path like 'platform/service/name'.")
-        return {"status": "error", "message": f"Ambiguous exploit module format: '{module_name}'. Provide path."}
-
-    logger.debug(f"Derived Full Path: '{full_module_path}', Base Name for modules.use(): '{base_module_name}'")
-    
-    if not base_module_name:
-        logger.error(f"Invalid exploit module name (empty base name): {module_name}")
-        return {"status": "error", "message": f"Invalid exploit module name: {module_name}"}
-
-    module_options = options or {}
-    final_payload_options = payload_options or {}
-    payload_base_name_for_use = None
-
-    try:
-        # --- Validate module existence ---
-        logger.debug("Checking if exploit module exists in Metasploit...")
-        available_exploits = await asyncio.to_thread(lambda: _msf_client_instance.modules.exploits)
-        if full_module_path not in available_exploits and base_module_name not in available_exploits:
-            # Try more flexible search (endswith check)
-            found_match = False
-            for exploit in available_exploits:
-                if exploit.endswith('/' + base_module_name):
-                    found_match = True
-                    logger.warning(f"Module found with different prefix: '{exploit}'. Proceeding with base path.")
-                    break
-            if not found_match:
-                logger.error(f"Exploit module '{full_module_path}' (or '{base_module_name}') not found in Metasploit's list.")
-                return {"status": "error", "message": f"Exploit module '{module_name}' not found in Metasploit."}
-        else:
-            logger.debug(f"Exploit module '{full_module_path}' or '{base_module_name}' confirmed.")
-
-        # --- Get the exploit module object ---
-        # Use the relative path (base_module_name) for modules.use()
-        module_obj = await asyncio.to_thread(lambda: _msf_client_instance.modules.use('exploit', base_module_name))
-        logger.debug(f"Successfully retrieved exploit module object for '{base_module_name}'")
-
-        # --- Set exploit options ---
-        for k, v in module_options.items():
-            # Basic type guessing (can be refined)
-            if isinstance(v, str):
-                if v.isdigit():
-                    try: v = int(v)
-                    except ValueError: pass # Keep as string if conversion fails
-                elif v.lower() in ('true', 'false'):
-                    v = v.lower() == 'true'
-            await asyncio.to_thread(lambda key=k, value=v: module_obj.__setitem__(key, value))
-
-        # --- Prepare payload object if needed ---
-        payload_obj_to_pass = None
-        if payload_name:
-            # Validate payload exists
-            available_payloads = await asyncio.to_thread(lambda: _msf_client_instance.modules.payloads)
-            
-            # Check if payload name is in the available payloads list
-            payload_found = False
-            actual_payload_path = None
-            
-            # Direct match
-            if payload_name in available_payloads:
-                payload_found = True
-                actual_payload_path = payload_name
-            # Check if it's a relative path that exists
-            elif any(p.endswith('/' + payload_name) for p in available_payloads):
-                for p in available_payloads:
-                    if p.endswith('/' + payload_name):
-                        payload_found = True
-                        actual_payload_path = p
-                        break
-            # Check with 'payload/' prefix
-            elif f"payload/{payload_name}" in available_payloads:
-                payload_found = True
-                actual_payload_path = payload_name
-            # Check for partial match if it contains a slash
-            elif '/' in payload_name:
-                for p in available_payloads:
-                    if payload_name in p:
-                        payload_found = True
-                        actual_payload_path = p
-                        logger.info(f"Found partial payload match: {p} for input {payload_name}")
-                        break
-            
-            if not payload_found:
-                logger.error(f"Payload '{payload_name}' not found in available Metasploit payloads.")
-                return {"status": "error", "message": f"Payload '{payload_name}' not found."}
-            
-            # Extract base name for modules.use call
-            if actual_payload_path:
-                # If the path has 'payload/' prefix, remove it for modules.use
-                if actual_payload_path.startswith('payload/'):
-                    payload_base_name_for_use = actual_payload_path.split('/', 1)[1]
-                else:
-                    payload_base_name_for_use = actual_payload_path
-                logger.debug(f"Using payload path '{payload_base_name_for_use}' for modules.use")
-            else:
-                payload_base_name_for_use = payload_name
-            
-            # Prepare payload object only if options are provided or running async
-            if run_as_job or final_payload_options:
-                logger.debug(f"Preparing payload object '{payload_base_name_for_use}' with options for execution.")
-                payload_obj = await asyncio.to_thread(lambda: _msf_client_instance.modules.use('payload', payload_base_name_for_use))
-                for k, v in final_payload_options.items():
-                    if isinstance(v, str):
-                        if v.isdigit():
-                            try: v = int(v)
-                            except ValueError: pass
-                        elif v.lower() in ('true', 'false'):
-                            v = v.lower() == 'true'
-                    await asyncio.to_thread(lambda key=k, value=v: payload_obj.__setitem__(key, value))
-                payload_obj_to_pass = payload_obj
-                logger.info(f"Executing exploit with configured payload object.")
-            else:
-                logger.info(f"Will set payload name '{payload_base_name_for_use}' via console for synchronous run.")
-
-        # --- Execute ---
-        if run_as_job:
-            # --- Asynchronous Execution (Run as Job) ---
-            # Pass the payload object if configured, otherwise pass the validated name string, or None
-            payload_arg = payload_obj_to_pass if payload_obj_to_pass else (payload_base_name_for_use if payload_name else None)
-            logger.info(f"Calling module_obj.execute(payload={type(payload_arg)}) for background job.")
-            exec_result = await asyncio.to_thread(lambda: module_obj.execute(payload=payload_arg))
-            logger.info(f"module_obj.execute() result: {exec_result}")
-
-            # Process job result
-            if isinstance(exec_result, dict):
-                job_id = exec_result.get('job_id')
-                uuid = exec_result.get('uuid')
-                if 'error' in exec_result and exec_result['error']:
-                    error_message = f"Failed to start exploit job: {exec_result.get('error_message', exec_result.get('error_string', 'Unknown error'))}"
-                    logger.error(error_message)
-                    return {"status": "error", "message": error_message, "module": full_module_path}
-                elif job_id is not None:
-                    message = f"Exploit module {full_module_path} started as job {job_id}."
-                    # Check for associated session quickly
-                    await asyncio.sleep(1.5) # Give session time to potentially appear
-                    sessions_list = await asyncio.to_thread(lambda: _msf_client_instance.sessions.list)
-                    found_session_id = None
-                    for s_id, s_info in sessions_list.items():
-                         # Ensure s_id is treated as string key for comparison if needed, RPC might return int/str
-                        s_id_str = str(s_id)
-                        if isinstance(s_info, dict) and s_info.get('exploit_uuid') == uuid:
-                            found_session_id = s_id # Keep original type from list keys
-                            message += f" Session {found_session_id} created."
-                            logger.info(f"Found session {found_session_id} matching exploit UUID {uuid}")
-                            break
-                    return {
-                        "status": "success", "message": message, "job_id": job_id, "uuid": uuid,
-                        "session_id": found_session_id, "module": full_module_path, "options": module_options,
-                        "payload_name": payload_name, "payload_options": final_payload_options
-                    }
-                else:
-                    logger.warning(f"Exploit job executed but no job_id returned: {exec_result}")
-                    return {"status": "unknown", "message": "Exploit executed, but no job ID returned.", "result": exec_result, "module": full_module_path}
-            else:
-                logger.error(f"Unexpected result format from exploit execute: {exec_result}")
-                return {"status": "error", "message": f"Unexpected result format from exploit execution: {exec_result}", "module": full_module_path}
-
-        else:
-            # --- Synchronous Execution (via Console) ---
-            logger.info(f"Executing {full_module_path} synchronously via console.")
-            async with get_msf_console() as console:
-                # Use the FULL module path for the 'use' command in console
-                setup_commands = [f"use {full_module_path}"]
-                # Add exploit options
-                for key, value in module_options.items():
-                    val_str = str(value)
-                    if isinstance(value, str) and (' ' in val_str or '"' in val_str or "'" in val_str):
-                         val_str = shlex.quote(val_str)
-                    elif isinstance(value, bool): # Ensure booleans are lowercase for console
-                        val_str = str(value).lower()
-                    setup_commands.append(f"set {key} {val_str}")
-
-                # Add payload and payload options (for console mode, set directly)
-                if payload_name and payload_base_name_for_use:
-                    setup_commands.append(f"set PAYLOAD {payload_base_name_for_use}")
-                    for key, value in final_payload_options.items():
-                        val_str = str(value)
-                        if isinstance(value, str) and (' ' in val_str or '"' in val_str or "'" in val_str):
-                             val_str = shlex.quote(val_str)
-                        elif isinstance(value, bool): # Ensure booleans are lowercase
-                            val_str = str(value).lower()
-                        setup_commands.append(f"set {key} {val_str}")
-
-                final_command = "exploit" # Synchronous command
-
-                # Execute setup commands
-                for cmd in setup_commands:
-                    logger.debug(f"Running setup command: {cmd}")
-                    setup_output = await run_command_safely(console, cmd, execution_timeout=15)
-                    if "[-] Error setting" in setup_output or "Invalid option" in setup_output or "[-] No results" in setup_output:
-                         error_msg = f"Error during setup command '{cmd}': {setup_output}"
-                         logger.error(error_msg)
-                         return {"status": "error", "message": error_msg}
-                    await asyncio.sleep(0.1) # Small delay between setup commands
-
-                # Execute the final command
-                logger.info(f"Running final command: {final_command}")
-                module_output = await run_command_safely(console, final_command, execution_timeout=timeout_seconds)
-                logger.debug(f"Synchronous execution output length: {len(module_output)}")
-
-                # Try to parse session ID from output
-                session_id = None
-                session_opened_line = ""
-                for line in module_output.splitlines():
-                    lower_line = line.lower()
-                    if ("session" in lower_line and "opened" in lower_line) or \
-                       ("command shell session" in lower_line and "opened" in lower_line):
-                        try:
-                            parts = line.split()
-                            for i, part in enumerate(parts):
-                                if part.isdigit() and i > 0 and parts[i-1].lower() == "session":
-                                    session_id = int(part)
-                                    session_opened_line = line # Store the line where it was found
-                                    logger.info(f"Detected session {session_id} opened in output: '{line}'")
-                                    break
-                            if session_id: break
-                        except (ValueError, IndexError): pass # Ignore parsing errors
-
-                return {
-                    "status": "success",
-                    "message": f"Exploit module {full_module_path} completed synchronously.",
-                    "module_output": module_output,
-                    "session_id_detected": session_id,
-                    "session_opened_line": session_opened_line if session_id else "",
-                    "module": full_module_path,
-                    "options": module_options,
-                    "payload_name": payload_name,
-                    "payload_options": final_payload_options
-                }
-
-    except MsfRpcError as e:
-        # More specific error checking
-        error_str = str(e).lower()
-        if "unknown module" in error_str or "failed to load" in error_str:
-            logger.error(f"Metasploit Error: Exploit module '{module_name}' not found or failed to load: {e}")
-            return {"status": "error", "message": f"Exploit module '{module_name}' not found or failed to load in Metasploit."}
-        elif "invalid payload" in error_str:
-            logger.error(f"Metasploit Error: Invalid payload specified for exploit {full_module_path}: {payload_name} - {e}")
-            return {"status": "error", "message": f"Invalid payload specified: {payload_name}"}
-        elif "missing required option" in error_str or "invalid option value" in error_str:
-            logger.error(f"Metasploit Error: Missing or invalid option for {full_module_path}: {e}")
-            return {"status": "error", "message": f"Missing or invalid option provided for exploit: {e}"}
-        else:
-            logger.error(f"MsfRpcError running exploit {full_module_path}: {e}")
-            return {"status": "error", "message": f"Metasploit RPC Error running exploit: {str(e)}"}
-    except Exception as e:
-        logger.exception(f"Unexpected error running exploit {full_module_path}")
-        return {"status": "error", "message": f"Unexpected server error running exploit: {str(e)}"}
+        return await _execute_module_console(
+            module_type='exploit',
+            module_name=module_name,
+            module_options=options,
+            command='exploit',
+            payload_spec=payload_spec,
+            timeout=timeout_seconds
+        )
 
 @mcp.tool()
 async def run_post_module(
@@ -777,252 +873,154 @@ async def run_post_module(
     session_id: int,
     options: Dict[str, Any] = None,
     run_as_job: bool = True,
-    timeout_seconds: int = 300
+    timeout_seconds: int = LONG_CONSOLE_READ_TIMEOUT
 ) -> Dict[str, Any]:
-    """Run a Metasploit post-exploitation module against a session."""
-    global _msf_client_instance
-    if _msf_client_instance is None: return {"status": "error", "message": "MSF client not initialized."}
+    """
+    Run a Metasploit post-exploitation module against a session.
 
-    if '/' not in module_name: module_name = f"post/{module_name}"
-    elif not module_name.startswith('post/'): logger.warning(f"Running non-post module '{module_name}' with run_post_module tool.")
+    Args:
+        module_name: Name/path of the post module (e.g., 'windows/gather/enum_shares').
+        session_id: The ID of the target session.
+        options: Dictionary of module options. 'SESSION' will be added automatically.
+        run_as_job: If True (default), run async via RPC. If False, run sync via console.
+        timeout_seconds: Max time for synchronous run via console.
 
-    logger.info(f"Running post module {module_name} on session {session_id}. Run as job: {run_as_job}")
+    Returns:
+        Dictionary with execution results or error details.
+    """
+    logger.info(f"Request to run post module {module_name} on session {session_id}. Job: {run_as_job}")
     module_options = options or {}
-    module_options['SESSION'] = session_id # Ensure session is always set
+    module_options['SESSION'] = session_id # Ensure SESSION is always set
 
+    # Add basic session validation before running
+    client = get_msf_client()
     try:
-        # --- Get the post module object ---
-        base_module_name = module_name # Assumes full path now
-        if base_module_name.startswith('post/'):
-            base_module_name = base_module_name.replace('post/', '', 1)
-
-        module_obj = await asyncio.to_thread(lambda: _msf_client_instance.modules.use('post', base_module_name))
-        logger.debug(f"Retrieved module object for '{base_module_name}'")
-
-        # --- Set module options ---
-        for k, v in module_options.items():
-            if isinstance(v, str):
-                if v.isdigit(): v = int(v)
-                elif v.lower() in ('true', 'false'): v = v.lower() == 'true'
-            # Ensure SESSION is int
-            if k == 'SESSION': v = int(v)
-            await asyncio.to_thread(lambda key=k, value=v: module_obj.__setitem__(key, value))
-            # logger.debug(f"Set post module option {k}={v}")
-
-        # --- Execute ---
-        if run_as_job:
-            # --- Asynchronous Execution (Run as Job) ---
-            logger.info(f"Executing {module_name} as background job.")
-            exec_result = await asyncio.to_thread(lambda: module_obj.execute()) # Post modules don't take payload arg
-            logger.info(f"module_obj.execute() result: {exec_result}")
-
-            if isinstance(exec_result, dict):
-                 job_id = exec_result.get('job_id')
-                 uuid = exec_result.get('uuid')
-                 if 'error' in exec_result and exec_result['error']:
-                     error_message = f"Failed to execute post module job: {exec_result.get('error_message', 'Unknown error')}"
-                     logger.error(error_message)
-                     return {"status": "error", "message": error_message, "module": module_name, "session_id": session_id}
-                 elif job_id is not None:
-                     return {"status": "success", "message": f"Post module {module_name} started as job {job_id}", "job_id": job_id, "uuid": uuid, "module": module_name, "session_id": session_id}
-                 else: # Attempt UUID matching if no job_id
-                     if uuid:
-                         await asyncio.sleep(1.0)
-                         jobs = await asyncio.to_thread(lambda: _msf_client_instance.jobs.list)
-                         for jid, jinfo in jobs.items():
-                             if isinstance(jinfo, dict) and jinfo.get('uuid') == uuid:
-                                 logger.info(f"Found matching job {jid} for uuid {uuid}")
-                                 return {"status": "success", "message": f"Post module {module_name} likely started as job {jid}", "job_id": jid, "uuid": uuid, "module": module_name, "session_id": session_id}
-                     logger.warning(f"Post module job executed but no job_id returned/matched: {exec_result}")
-                     return {"status": "unknown", "message": "Post module execution finished, but job ID missing/unmatched.", "result": exec_result, "module": module_name, "session_id": session_id}
-            else:
-                 logger.error(f"Unexpected result format from post module execute: {exec_result}")
-                 return {"status": "error", "message": f"Unexpected result format from post execution: {exec_result}", "module": module_name}
-
-        else:
-            # --- Synchronous Execution (via Console) ---
-            # TODO: Consider alternative using console.run_module_with_output(module_obj)
-            logger.info(f"Executing {module_name} synchronously via console.")
-            async with get_msf_console() as console:
-                setup_commands = [f"use {module_name}"]
-                # Add options
-                for key, value in module_options.items():
-                    val_str = str(value)
-                    if isinstance(value, str) and (' ' in val_str or '"' in val_str or "'" in val_str):
-                        val_str = shlex.quote(val_str)
-                    setup_commands.append(f"set {key} {val_str}")
-
-                final_command = "run" # Synchronous command
-
-                # Execute setup commands
-                for cmd in setup_commands:
-                    logger.debug(f"Running setup command: {cmd}")
-                    setup_output = await run_command_safely(console, cmd, execution_timeout=15)
-                    if "[-] Error setting" in setup_output or "Invalid option" in setup_output:
-                         error_msg = f"Error during setup command '{cmd}': {setup_output}"
-                         logger.error(error_msg)
-                         return {"status": "error", "message": error_msg}
-                    await asyncio.sleep(0.1)
-
-                # Execute the final command
-                logger.info(f"Running final command: {final_command}")
-                module_output = await run_command_safely(console, final_command, execution_timeout=timeout_seconds)
-                logger.debug(f"Synchronous execution output length: {len(module_output)}")
-
-                return {
-                    "status": "success",
-                    "message": f"Post module {module_name} completed synchronously.",
-                    "module_output": module_output,
-                    "module": module_name,
-                    "session_id": session_id,
-                    "options": options # Return original options
-                }
-
+        current_sessions = await asyncio.to_thread(lambda: client.sessions.list)
+        if str(session_id) not in current_sessions:
+             logger.error(f"Session {session_id} not found for post module {module_name}.")
+             return {"status": "error", "message": f"Session {session_id} not found.", "module": module_name}
     except MsfRpcError as e:
-        if "Unknown module" in str(e): return {"status": "error", "message": f"Post module {module_name} not found."}
-        if "Invalid Session" in str(e) or "Session ID is not valid" in str(e): return {"status": "error", "message": f"Invalid Session ID: {session_id} for module {module_name}."}
-        logger.error(f"MsfRpcError running post module {module_name}: {e}")
-        return {"status": "error", "message": f"Error running post module: {str(e)}"}
-    except Exception as e:
-        logger.exception(f"Unexpected error running post module {module_name}")
-        return {"status": "error", "message": f"Unexpected error running post module: {str(e)}"}
+        logger.error(f"Failed to validate session {session_id} before running post module: {e}")
+        # Optionally proceed with caution or return error
+        return {"status": "error", "message": f"Error validating session {session_id}: {e}", "module": module_name}
 
+
+    if run_as_job:
+        return await _execute_module_rpc(
+            module_type='post',
+            module_name=module_name,
+            module_options=module_options
+            # No payload for post modules
+        )
+    else:
+        return await _execute_module_console(
+            module_type='post',
+            module_name=module_name,
+            module_options=module_options,
+            command='run',
+            timeout=timeout_seconds
+        )
 
 @mcp.tool()
 async def run_auxiliary_module(
     module_name: str,
     options: Dict[str, Any],
-    run_as_job: bool = False, # Default False for scanners makes sense
-    timeout_seconds: int = 300
+    run_as_job: bool = False, # Default False for scanners often makes sense
+    check_target: bool = False, # Add check option similar to exploit
+    timeout_seconds: int = LONG_CONSOLE_READ_TIMEOUT
 ) -> Dict[str, Any]:
-    """Run a Metasploit auxiliary module."""
-    global _msf_client_instance
-    if _msf_client_instance is None: return {"status": "error", "message": "MSF client not initialized."}
+    """
+    Run a Metasploit auxiliary module.
 
-    if '/' not in module_name: module_name = f"auxiliary/{module_name}"
-    elif not module_name.startswith('auxiliary/'):
-        return {"status": "error", "message": f"Invalid auxiliary module name: {module_name}."}
+    Args:
+        module_name: Name/path of the auxiliary module (e.g., 'scanner/ssh/ssh_login').
+        options: Dictionary of module options (e.g., {'RHOSTS': ..., 'USERNAME': ...}).
+        run_as_job: If False (default), run sync via console. If True, run async via RPC.
+        check_target: If True, run module's 'check' action first (if available).
+        timeout_seconds: Max time for synchronous run via console.
 
-    logger.info(f"Running auxiliary module {module_name}. Run as job: {run_as_job}. Options: {options}")
+    Returns:
+        Dictionary with execution results or error details.
+    """
+    logger.info(f"Request to run auxiliary module {module_name}. Job: {run_as_job}, Check: {check_target}")
     module_options = options or {}
 
-    try:
-        # --- Get the auxiliary module object ---
-        base_module_name = module_name.replace('auxiliary/', '', 1)
-        module_obj = await asyncio.to_thread(lambda: _msf_client_instance.modules.use('auxiliary', base_module_name))
-        logger.debug(f"Retrieved module object for '{base_module_name}'")
+    if check_target:
+        logger.info(f"Performing check first for auxiliary module {module_name}...")
+        try:
+             # Use the console helper for 'check'
+             check_result = await _execute_module_console(
+                 module_type='auxiliary',
+                 module_name=module_name,
+                 module_options=options,
+                 command='check',
+                 timeout=timeout_seconds
+             )
+             logger.info(f"Auxiliary check result: {check_result.get('status')} - {check_result.get('message')}")
+             output = check_result.get("module_output", "").lower()
+             # Generic check for positive outcome (aux check output varies widely)
+             is_positive = "host is likely vulnerable" in output or "target appears reachable" in output or "+ check" in output
+             is_negative = "host is not vulnerable" in output or "target is not reachable" in output or "check failed" in output
 
-        # --- Set module options ---
-        for k, v in module_options.items():
-            if isinstance(v, str):
-                if v.isdigit(): v = int(v)
-                elif v.lower() in ('true', 'false'): v = v.lower() == 'true'
-            await asyncio.to_thread(lambda key=k, value=v: module_obj.__setitem__(key, value))
-            # logger.debug(f"Set auxiliary module option {k}={v}")
+             if is_negative or (not is_positive and check_result.get("status") == "error"):
+                 logger.warning(f"Check indicates target may not be suitable for {module_name}.")
+                 return {"status": "aborted", "message": f"Check indicates target unsuitable. Module not run.", "check_output": check_result.get("module_output")}
+             elif not is_positive:
+                 logger.warning(f"Check result inconclusive for {module_name}. Proceeding with run.")
+             else:
+                 logger.info(f"Check appears positive for {module_name}. Proceeding.")
 
-        # --- Execute ---
-        if run_as_job:
-            # --- Asynchronous Execution (Run as Job) ---
-            logger.info(f"Executing {module_name} as background job.")
-            exec_result = await asyncio.to_thread(lambda: module_obj.execute()) # Aux modules don't take payload arg
-            logger.info(f"module_obj.execute() result: {exec_result}")
+        except Exception as chk_e:
+             logger.warning(f"Check failed for auxiliary {module_name}: {chk_e}. Proceeding with run attempt.")
 
-            if isinstance(exec_result, dict):
-                job_id = exec_result.get('job_id')
-                uuid = exec_result.get('uuid')
-                if 'error' in exec_result and exec_result['error']:
-                    error_message = f"Failed to execute auxiliary module job: {exec_result.get('error_message', 'Unknown error')}"
-                    logger.error(error_message)
-                    return {"status": "error", "message": error_message, "module": module_name, "options": options}
-                elif job_id is not None:
-                    return {"status": "success", "message": f"Auxiliary module {module_name} started as job {job_id}", "job_id": job_id, "uuid": uuid, "module": module_name, "options": options}
-                else: # Attempt UUID matching
-                    if uuid:
-                        await asyncio.sleep(1.0)
-                        jobs = await asyncio.to_thread(lambda: _msf_client_instance.jobs.list)
-                        for jid, jinfo in jobs.items():
-                            if isinstance(jinfo, dict) and jinfo.get('uuid') == uuid:
-                                logger.info(f"Found matching job {jid} for uuid {uuid}")
-                                return {"status": "success", "message": f"Auxiliary module {module_name} likely started as job {jid}", "job_id": jid, "uuid": uuid, "module": module_name, "options": options}
-                    logger.warning(f"Auxiliary module job executed but no job_id returned/matched: {exec_result}")
-                    return {"status": "unknown", "message": "Auxiliary module executed, but job ID missing/unmatched.", "result": exec_result, "module": module_name, "options": options}
-            else:
-                logger.error(f"Unexpected result format from auxiliary module execute: {exec_result}")
-                return {"status": "error", "message": f"Unexpected result format from auxiliary execution: {exec_result}", "module": module_name}
-        else:
-            # --- Synchronous Execution (via Console) ---
-            # TODO: Consider alternative using console.run_module_with_output(module_obj)
-            logger.info(f"Executing {module_name} synchronously via console.")
-            async with get_msf_console() as console:
-                setup_commands = [f"use {module_name}"]
-                for key, value in module_options.items():
-                    val_str = str(value)
-                    if isinstance(value, str) and (' ' in val_str or '"' in val_str or "'" in val_str):
-                        val_str = shlex.quote(val_str)
-                    setup_commands.append(f"set {key} {val_str}")
-
-                final_command = "run"
-
-                for cmd in setup_commands:
-                    logger.debug(f"Running setup command: {cmd}")
-                    setup_output = await run_command_safely(console, cmd, execution_timeout=15)
-                    if "[-] Error setting" in setup_output or "Invalid option" in setup_output:
-                        error_msg = f"Error during setup command '{cmd}': {setup_output}"
-                        logger.error(error_msg)
-                        return {"status": "error", "message": error_msg}
-                    await asyncio.sleep(0.1)
-
-                logger.info(f"Running final command: {final_command}")
-                module_output = await run_command_safely(console, final_command, execution_timeout=timeout_seconds)
-                logger.debug(f"Synchronous execution output length: {len(module_output)}")
-
-                return {
-                    "status": "success",
-                    "message": f"Auxiliary module {module_name} completed synchronously.",
-                    "module_output": module_output,
-                    "module": module_name,
-                    "options": options
-                }
-
-    except MsfRpcError as e:
-        if "Unknown module" in str(e): return {"status": "error", "message": f"Auxiliary module {module_name} not found."}
-        logger.error(f"MsfRpcError running auxiliary module {module_name}: {e}")
-        return {"status": "error", "message": f"Error running auxiliary module: {str(e)}"}
-    except Exception as e:
-        logger.exception(f"Unexpected error running auxiliary module {module_name}")
-        return {"status": "error", "message": f"Unexpected error running auxiliary module: {str(e)}"}
+    if run_as_job:
+        return await _execute_module_rpc(
+            module_type='auxiliary',
+            module_name=module_name,
+            module_options=module_options
+            # No payload for aux modules
+        )
+    else:
+        return await _execute_module_console(
+            module_type='auxiliary',
+            module_name=module_name,
+            module_options=module_options,
+            command='run',
+            timeout=timeout_seconds
+        )
 
 @mcp.tool()
 async def list_active_sessions() -> Dict[str, Any]:
-    """List active Metasploit sessions."""
-    global _msf_client_instance
-    if _msf_client_instance is None: return {"status": "error", "message": "MSF client not initialized."}
+    """List active Metasploit sessions with their details."""
+    client = get_msf_client()
     logger.info("Listing active Metasploit sessions.")
     try:
-        sessions_dict = await asyncio.to_thread(lambda: _msf_client_instance.sessions.list)
+        sessions_dict = await asyncio.to_thread(lambda: client.sessions.list)
         if not isinstance(sessions_dict, dict):
             logger.error(f"Expected dict from sessions.list, got {type(sessions_dict)}")
             return {"status": "error", "message": f"Unexpected data type for sessions list: {type(sessions_dict)}"}
+
         logger.info(f"Found {len(sessions_dict)} active sessions.")
-        # Convert keys to strings for consistent JSON if they are integers
+        # Ensure keys are strings for consistent JSON
         sessions_dict_str_keys = {str(k): v for k, v in sessions_dict.items()}
-        return {"status": "success", "sessions": sessions_dict_str_keys}
+        return {"status": "success", "sessions": sessions_dict_str_keys, "count": len(sessions_dict_str_keys)}
     except MsfRpcError as e:
         logger.error(f"Failed to list sessions: {e}")
-        return {"status": "error", "message": f"Error listing sessions: {str(e)}"}
+        return {"status": "error", "message": f"Error listing sessions: {e}"}
     except Exception as e:
         logger.exception("Unexpected error listing sessions.")
-        return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+        return {"status": "error", "message": f"Unexpected error listing sessions: {e}"}
 
 @mcp.tool()
 async def send_session_command(
-    session_id: int, # Keep as int for input clarity
+    session_id: int,
     command: str,
-    timeout_seconds: int = 60,
+    timeout_seconds: int = SESSION_COMMAND_TIMEOUT,
 ) -> Dict[str, Any]:
     """
-    Send a command to an active Metasploit session and get output.
-    Uses simple write/read loop. Consider session.run_with_output for more robustness.
+    Send a command to an active Metasploit session (Meterpreter or Shell) and get output.
+    Uses session.run_with_output for Meterpreter, and a prompt-aware loop for shells.
+    The agent is responsible for parsing the raw output.
 
     Args:
         session_id: ID of the target session.
@@ -1030,334 +1028,151 @@ async def send_session_command(
         timeout_seconds: Maximum time to wait for the command to complete.
 
     Returns:
-        Dictionary with status and command output or error details.
+        Dictionary with status ('success', 'error', 'timeout') and raw command output.
     """
-    global _msf_client_instance
-    if _msf_client_instance is None: return {"status": "error", "message": "MSF client not initialized."}
-
+    client = get_msf_client()
     logger.info(f"Sending command to session {session_id}: '{command}'")
+    session_id_str = str(session_id)
+
     try:
-        session_id_str = str(session_id) # Convert to string for library interaction
-        session = await asyncio.to_thread(lambda: _msf_client_instance.sessions.session(session_id_str))
+        # --- Get Session Info and Object ---
+        current_sessions = await asyncio.to_thread(lambda: client.sessions.list)
+        if session_id_str not in current_sessions:
+            logger.error(f"Session {session_id} not found.")
+            return {"status": "error", "message": f"Session {session_id} not found."}
 
-        if not session: # Check if session object was retrieved
-             # Double check list in case session ended between list and access
-             current_sessions = await asyncio.to_thread(lambda: _msf_client_instance.sessions.list)
-             if session_id_str not in current_sessions:
-                  logger.error(f"Session {session_id} not found in current list.")
-                  return {"status": "error", "message": f"Session {session_id} not found."}
-             else:
-                  # This case indicates an issue with sessions.session(id) retrieval itself
-                  logger.error(f"Session {session_id} exists in list but sessions.session() failed.")
-                  return {"status": "error", "message": f"Error retrieving session {session_id} object."}
+        session_info = current_sessions[session_id_str]
+        session_type = session_info.get('type', 'unknown').lower() if isinstance(session_info, dict) else 'unknown'
+        logger.debug(f"Session {session_id} type: {session_type}")
 
-        # --- Use session.write and session.read loop ---
-        # TODO: Consider refactoring using session.run_with_output(command, terminating_strs=[...])
-        # which might be more robust for handling command completion detection.
-        logger.debug(f"Writing command to session {session_id}: {command}")
-        await asyncio.to_thread(session.write, command + '\n')
+        session = await asyncio.to_thread(lambda: client.sessions.session(session_id_str))
+        if not session:
+            logger.error(f"Failed to get session object for existing session {session_id}.")
+            return {"status": "error", "message": f"Error retrieving session {session_id} object."}
 
-        output_buffer = ""
-        start_time = asyncio.get_event_loop().time()
-        read_interval = 0.2 # Check frequently
-        last_read_time = start_time
-        no_data_timeout = 10 # How long to wait with NO data before assuming completion (if not timed out overall)
+        # --- Execute Command Based on Type ---
+        output = ""
+        status = "error" # Default status
+        message = "Command execution failed or type unknown."
 
-        while (asyncio.get_event_loop().time() - start_time) < timeout_seconds:
-            await asyncio.sleep(read_interval)
-            current_time = asyncio.get_event_loop().time()
-            read_data = await asyncio.to_thread(session.read) # Returns string directly for sessions
+        if session_type == 'meterpreter':
+            logger.debug(f"Using session.run_with_output for Meterpreter session {session_id}")
+            terminators = ['meterpreter > ']
+            try:
+                output = await asyncio.to_thread(
+                    lambda: session.run_with_output(
+                        command,
+                        terminating_strs=terminators,
+                        timeout=timeout_seconds,
+                        timeout_exception=True # Raise TimeoutError on timeout
+                    )
+                )
+                status = "success"
+                message = "Meterpreter command executed successfully."
+                logger.debug(f"Meterpreter command '{command}' completed.")
+            except TimeoutError:
+                status = "timeout"
+                message = f"Meterpreter command timed out after {timeout_seconds} seconds."
+                logger.warning(f"Command '{command}' timed out on Meterpreter session {session_id}")
+                # Try a final read for potentially partial output
+                try:
+                    output = await asyncio.to_thread(lambda: session.read()) or ""
+                except: pass
+            except (MsfRpcError, Exception) as run_err:
+                logger.error(f"Error during Meterpreter run_with_output for command '{command}': {run_err}")
+                message = f"Error executing Meterpreter command: {run_err}"
+                # Try a final read
+                try:
+                    output = await asyncio.to_thread(lambda: session.read()) or ""
+                except: pass
 
-            if read_data:
-                # logger.debug(f"Session {session_id} read: {read_data}")
-                output_buffer += read_data
-                last_read_time = current_time # Reset inactivity timer
+        elif session_type == 'shell':
+            logger.debug(f"Using manual read loop for Shell session {session_id}")
+            try:
+                await asyncio.to_thread(lambda: session.write(command + "\n"))
 
-                # Optional: Check for prompts to break early (can be fragile)
-                # stripped_output = output_buffer.strip()
-                # if any(stripped_output.endswith(p) for p in ["meterpreter >", "> \n", "# \n", "$ \n"]):
-                #    logger.debug("Detected potential prompt, finishing read early.")
-                #    break
-            elif (current_time - last_read_time) > no_data_timeout:
-                 logger.debug(f"No data received from session {session_id} for {no_data_timeout}s, assuming command finished.")
-                 break # Assume finished if no data for a while
+                # If the command is exit, don't wait for output/prompt, assume it worked
+                if command.strip().lower() == 'exit':
+                    logger.info(f"Sent 'exit' to shell session {session_id}, assuming success without reading output.")
+                    status = "success"
+                    message = "Exit command sent to shell session."
+                    output = "(No output expected after exit)"
+                    # Skip the read loop for exit command
+                    return {"status": status, "message": message, "output": output}
 
-        # --- Determine final status ---
-        final_status = "success"
-        message = "Command executed."
-        if (asyncio.get_event_loop().time() - start_time) >= timeout_seconds:
-             if output_buffer:
-                 logger.warning(f"Command '{command}' potentially timed out after {timeout_seconds}s on session {session_id}. Returning partial output.")
-                 final_status = "timeout"
-                 message = f"Command potentially timed out after {timeout_seconds} seconds. Returning collected output."
-             else:
-                 logger.warning(f"Command '{command}' timed out after {timeout_seconds}s on session {session_id}. No output received.")
-                 final_status = "timeout"
-                 message = f"Command execution timed out after {timeout_seconds} seconds. No output received."
+                # Proceed with read loop for non-exit commands
+                output_buffer = ""
+                start_time = asyncio.get_event_loop().time()
+                last_data_time = start_time
+                read_interval = 0.1
 
-        # Limit output size for response
-        output_preview = output_buffer[:2000] + ('...' if len(output_buffer) > 2000 else '')
-        return {"status": final_status, "message": message, "output": output_preview}
+                while True:
+                    now = asyncio.get_event_loop().time()
+                    if (now - start_time) > timeout_seconds:
+                        status = "timeout"
+                        message = f"Shell command timed out after {timeout_seconds} seconds."
+                        logger.warning(f"Command '{command}' timed out on Shell session {session_id}")
+                        break
+
+                    chunk = await asyncio.to_thread(lambda: session.read())
+                    if chunk:
+                         output_buffer += chunk
+                         last_data_time = now
+                         # Check if the prompt appears at the end of the current buffer
+                         if SHELL_PROMPT_RE.search(output_buffer):
+                             logger.debug(f"Detected shell prompt for command '{command}'.")
+                             status = "success"
+                             message = "Shell command executed successfully."
+                             break
+                    elif (now - last_data_time) > SESSION_READ_INACTIVITY_TIMEOUT:
+                         logger.debug(f"Shell inactivity timeout ({SESSION_READ_INACTIVITY_TIMEOUT}s) reached for command '{command}'. Assuming complete.")
+                         status = "success" # Assume success if inactive after sending command
+                         message = "Shell command likely completed (inactivity)."
+                         break
+
+                    await asyncio.sleep(read_interval)
+                output = output_buffer # Assign final buffer to output
+            except (MsfRpcError, Exception) as run_err:
+                # Special handling for errors after sending 'exit'
+                if command.strip().lower() == 'exit':
+                    logger.warning(f"Error occurred after sending 'exit' to shell {session_id}: {run_err}. This might be expected as session closes.")
+                    status = "success" # Treat as success
+                    message = f"Exit command sent, subsequent error likely due to session closing: {run_err}"
+                    output = "(Error reading after exit, likely expected)"
+                else:
+                    logger.error(f"Error during Shell write/read loop for command '{command}': {run_err}")
+                    message = f"Error executing Shell command: {run_err}"
+                    output = output_buffer # Return potentially partial output
+
+        else: # Unknown session type
+            logger.warning(f"Cannot execute command: Unknown session type '{session_type}' for session {session_id}")
+            message = f"Cannot execute command: Unknown session type '{session_type}'."
+
+        return {"status": status, "message": message, "output": output}
 
     except MsfRpcError as e:
-        # Check specific errors if needed (e.g., session invalid errors)
         if "Session ID is not valid" in str(e):
              logger.error(f"RPC Error: Session {session_id} is invalid: {e}")
              return {"status": "error", "message": f"Session {session_id} is not valid."}
-        logger.error(f"MsfRpcError sending command to session {session_id}: {e}")
-        return {"status": "error", "message": f"Error interacting with session {session_id}: {str(e)}"}
-    except KeyError: # Library might raise this if session ID is missing internally
-        logger.error(f"Session {session_id} likely not found (KeyError).")
-        return {"status": "error", "message": f"Session {session_id} not found."}
+        logger.error(f"MsfRpcError interacting with session {session_id}: {e}")
+        return {"status": "error", "message": f"Error interacting with session {session_id}: {e}"}
+    except KeyError: # May occur if session disappears between list and access
+        logger.error(f"Session {session_id} likely disappeared (KeyError).")
+        return {"status": "error", "message": f"Session {session_id} not found or disappeared."}
     except Exception as e:
         logger.exception(f"Unexpected error sending command to session {session_id}.")
-        return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+        return {"status": "error", "message": f"Unexpected server error sending command: {e}"}
 
 
-# --- Tools wrapping send_session_command ---
-# These tools rely on send_session_command's behavior.
-# Consider using session.run_with_output within them directly for more specific termination conditions if needed.
-
-async def _verify_meterpreter_session(session_id: int) -> Tuple[Optional[Dict], Optional[str]]:
-    """Helper to check if a session exists and is Meterpreter."""
-    global _msf_client_instance
-    if _msf_client_instance is None: return None, "MSF client not initialized."
-    try:
-        session_id_str = str(session_id)
-        # Check list first for existence
-        current_sessions = await asyncio.to_thread(lambda: _msf_client_instance.sessions.list)
-        if session_id_str not in current_sessions:
-             logger.error(f"Session {session_id} not found in list.")
-             return None, f"Session {session_id} not found."
-
-        session_info = current_sessions[session_id_str] # Use info from list
-        if not isinstance(session_info, dict):
-             logger.error(f"Unexpected session info format for {session_id}: {session_info}")
-             return None, f"Error retrieving session info for {session_id}."
-
-        session_type = session_info.get('type')
-        if session_type != 'meterpreter':
-            logger.warning(f"Session {session_id} is not Meterpreter (type: {session_type}).")
-            return None, f"Session {session_id} is type '{session_type}', requires Meterpreter."
-
-        return session_info, None # Return session info if meterpreter, no error
-    except MsfRpcError as e:
-        logger.error(f"RPC error checking session {session_id} type: {e}")
-        return None, f"RPC error checking session {session_id}."
-    except Exception as e:
-        logger.exception(f"Unexpected error checking session {session_id} type.")
-        return None, f"Unexpected error checking session {session_id}."
-
-@mcp.tool()
-async def get_system_info(session_id: int) -> Dict[str, Any]:
-    """Get system information from a Meterpreter session."""
-    logger.info(f"Getting system info for session {session_id}")
-    session_info, error = await _verify_meterpreter_session(session_id)
-    if error: return {"status": "error", "message": error}
-
-    sysinfo_result = await send_session_command(session_id, 'sysinfo', timeout_seconds=30)
-
-    if sysinfo_result.get("status") in ["success", "timeout"]:
-        raw_output = sysinfo_result.get("output", "")
-        logger.info(f"Received sysinfo output (Status: {sysinfo_result.get('status')}). Parsing...")
-        parsed_info = {}
-        for line in raw_output.splitlines():
-            if ':' in line:
-                key, value = line.split(':', 1)
-                parsed_info[key.strip()] = value.strip()
-        return {"status": "success", "sysinfo": parsed_info, "raw_output": raw_output, "command_status": sysinfo_result.get("status")}
-    else:
-        logger.error(f"Failed to run 'sysinfo' via send_session_command: {sysinfo_result.get('message')}")
-        return sysinfo_result
-
-@mcp.tool()
-async def get_user_id(session_id: int) -> Dict[str, Any]:
-    """Get the current user ID from a Meterpreter session."""
-    logger.info(f"Getting user ID for session {session_id}")
-    session_info, error = await _verify_meterpreter_session(session_id)
-    if error: return {"status": "error", "message": error}
-
-    getuid_result = await send_session_command(session_id, 'getuid', timeout_seconds=30)
-
-    if getuid_result.get("status") in ["success", "timeout"]:
-        raw_output = getuid_result.get("output", "")
-        logger.info(f"Received getuid output (Status: {getuid_result.get('status')}): {raw_output.strip()}")
-        username = raw_output.strip()
-        if ":" in username: # Handle "Server username: ..." format
-            username = username.split(":", 1)[1].strip()
-        return {"status": "success", "username": username, "raw_output": raw_output, "command_status": getuid_result.get("status")}
-    else:
-        logger.error(f"Failed to run 'getuid' via send_session_command: {getuid_result.get('message')}")
-        return getuid_result
-
-@mcp.tool()
-async def list_processes(session_id: int) -> Dict[str, Any]:
-    """List running processes via a Meterpreter session."""
-    logger.info(f"Listing processes for session {session_id}")
-    session_info, error = await _verify_meterpreter_session(session_id)
-    if error: return {"status": "error", "message": error}
-
-    ps_result = await send_session_command(session_id, 'ps', timeout_seconds=45)
-
-    if ps_result.get("status") in ["success", "timeout"]:
-        raw_output = ps_result.get("output", "")
-        logger.info(f"Received ps output (Status: {ps_result.get('status')}). Parsing...")
-        lines = raw_output.strip().splitlines()
-        processes = []
-        header_found = False
-        pid_col, ppid_col, name_col = -1, -1, -1 # Basic columns
-
-        for line in lines:
-            stripped_line = line.strip()
-            if not stripped_line: continue
-
-            if "PID" in line and "Name" in line: # Find header row
-                header_found = True
-                pid_col = line.find("PID")
-                ppid_col = line.find("PPID")
-                name_col = line.find("Name")
-                # Basic column presence check
-                if not all(c >= 0 for c in [pid_col, ppid_col, name_col]):
-                     logger.warning(f"Could not reliably determine PID/PPID/Name columns in header: {line}")
-                     header_found = False # Treat as unparsable if basic columns missing
-                continue
-
-            if not header_found: continue
-
-            try:
-                # Simple split parsing, assuming reasonable spacing
-                parts = stripped_line.split(None, 2) # Split into PID, PPID, rest (Name + others)
-                if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
-                    proc_info = {
-                        "pid": int(parts[0]),
-                        "ppid": int(parts[1]),
-                        "name": parts[2].split()[0] if parts[2].split() else "" # Extract first word as name
-                        # Add more parsing here if needed (User, Arch, Path) - complex/fragile
-                    }
-                    processes.append(proc_info)
-                elif len(parts) >= 1 and parts[0].isdigit(): # Fallback if only PID found
-                     logger.debug(f"Parsing process line with only PID? : {line}")
-                     # processes.append({"pid": int(parts[0]), "name": " ".join(parts[1:])})
-            except Exception as parse_e:
-                logger.warning(f"Could not parse process line: '{line}'. Error: {parse_e}")
-
-        status_msg = f"Processed 'ps' output (Status: {ps_result.get('status')}). Found {len(processes)} processes."
-        if not header_found and raw_output:
-            status_msg = "Retrieved process list but couldn't parse structured data (header not found)."
-            return {"status": "partial_success", "message": status_msg, "raw_output": raw_output}
-
-        return {"status": "success", "message": status_msg, "processes": processes, "process_count": len(processes), "raw_output": raw_output}
-    else:
-        logger.error(f"Failed to run 'ps' via send_session_command: {ps_result.get('message')}")
-        return ps_result
-
-@mcp.tool()
-async def migrate_process(session_id: int, pid: int) -> Dict[str, Any]:
-    """Migrate the Meterpreter session to another process."""
-    logger.info(f"Attempting to migrate session {session_id} to process {pid}")
-    session_info, error = await _verify_meterpreter_session(session_id)
-    if error: return {"status": "error", "message": error}
-
-    migrate_command = f"migrate {pid}"
-    migrate_result = await send_session_command(session_id, migrate_command, timeout_seconds=60)
-
-    if migrate_result.get("status") not in ["success", "timeout"]:
-        logger.error(f"Failed to run 'migrate' command: {migrate_result.get('message')}")
-        return migrate_result
-
-    raw_output = migrate_result.get("output", "")
-    logger.info(f"Migration command finished (Status: {migrate_result.get('status')}). Raw output:\n{raw_output}")
-
-    success = "[+] Migration completed successfully" in raw_output or "[+] Successfully migrated" in raw_output
-    failure = "[-] Migration failed" in raw_output or "Operation failed" in raw_output
-
-    final_status = "success" if success else "error" if failure else "unknown"
-    message = "Migration completed successfully." if success else "Migration failed." if failure else "Migration status unknown (check raw output)."
-    if migrate_result.get("status") == "timeout":
-        final_status = "unknown"
-        message = f"Migration command timed out. Status unknown."
-
-    return {"status": final_status, "message": message, "target_pid": pid, "raw_output": raw_output}
-
-@mcp.tool()
-async def filesystem_list(session_id: int, remote_path: str) -> Dict[str, Any]:
-    """List files in a directory via a Meterpreter session."""
-    logger.info(f"Listing files at '{remote_path}' for session {session_id}")
-
-    if not isinstance(remote_path, str) or any(c in remote_path for c in ';|&`$()<>'):
-        logger.error(f"Invalid characters detected in remote path: {remote_path}")
-        return {"status": "error", "message": "Invalid path provided."}
-
-    session_info, error = await _verify_meterpreter_session(session_id)
-    if error: return {"status": "error", "message": error}
-
-    # Escape double quotes in the path for the command string
-    escaped_path = remote_path.replace("\"", "\\\"")
-    ls_command = f'ls "{escaped_path}"'
-    ls_result = await send_session_command(session_id, ls_command, timeout_seconds=30)
-
-    if ls_result.get("status") in ["success", "timeout"]:
-        raw_output = ls_result.get("output", "")
-        logger.info(f"Received ls output (Status: {ls_result.get('status')}). Parsing...")
-        lines = raw_output.strip().splitlines()
-        files = []
-        header_found = False
-        listing_path = remote_path # Default path
-        message = f"Listing for '{remote_path}'"
-
-        for line in lines:
-            stripped = line.strip()
-            if not stripped: continue
-            if stripped.startswith("Listing:"):
-                try: listing_path = stripped.split(":", 1)[1].strip()
-                except: pass
-                continue
-            if "Mode" in stripped and "Size" in stripped and "Type" in stripped:
-                header_found = True
-                continue
-            if not header_found: continue
-
-            # Basic parsing assuming space separation
-            parts = stripped.split(None, 4)
-            if len(parts) >= 5:
-                try:
-                    size_val = parts[1]
-                    size_int = int(size_val) if size_val.isdigit() else size_val # Keep non-int size as string
-                    files.append({
-                        "mode": parts[0],
-                        "size": size_int,
-                        "type": parts[2],
-                        "last_modified": parts[3],
-                        "name": parts[4]
-                    })
-                except Exception as parse_e: logger.warning(f"Could not parse file line '{stripped}': {parse_e}")
-            # else: logger.debug(f"Skipping potential non-file line: {stripped}")
-
-        # Determine final status message
-        if "Operation failed: The system cannot find the file specified." in raw_output or "No such file or directory" in raw_output:
-             return {"status": "error", "message": f"Path '{remote_path}' not found or error during listing.", "raw_output": raw_output}
-        elif not files and header_found: message = f"Directory '{listing_path}' is empty or contains no parsable items."
-        elif not files and not header_found:
-             message = f"Command executed for '{listing_path}', but could not parse output. Check raw output."
-             return {"status": "partial_success", "message": message, "path": listing_path, "raw_output": raw_output}
-        elif files: message = f"Successfully listed {len(files)} files/dirs in '{listing_path}'."
-
-        return {"status": "success", "path": listing_path, "files": files, "file_count": len(files), "message": message, "raw_output": raw_output}
-    else:
-        logger.error(f"Failed to run 'ls' via send_session_command: {ls_result.get('message')}")
-        raw_output = ls_result.get("output", "") # Check output even on error
-        if "Operation failed: The system cannot find the file specified." in raw_output or "No such file or directory" in raw_output:
-            return {"status": "error", "message": f"Path '{remote_path}' not found or error during listing.", "raw_output": raw_output}
-        return ls_result # Propagate other errors
+# --- Job and Listener Management Tools ---
 
 @mcp.tool()
 async def list_listeners() -> Dict[str, Any]:
-    """List all active Metasploit jobs, categorized into handlers and others."""
-    global _msf_client_instance
-    if _msf_client_instance is None: return {"status": "error", "message": "MSF client not initialized."}
+    """List all active Metasploit jobs, categorizing exploit/multi/handler jobs."""
+    client = get_msf_client()
     logger.info("Listing active listeners/jobs")
     try:
-        jobs = await asyncio.to_thread(lambda: _msf_client_instance.jobs.list)
+        jobs = await asyncio.to_thread(lambda: client.jobs.list)
         if not isinstance(jobs, dict):
             logger.error(f"Unexpected data type for jobs list: {type(jobs)}")
             return {"status": "error", "message": f"Unexpected data type for jobs list: {type(jobs)}"}
@@ -1365,445 +1180,236 @@ async def list_listeners() -> Dict[str, Any]:
         logger.info(f"Retrieved {len(jobs)} active jobs from MSF.")
         handlers = {}
         other_jobs = {}
-        
-        # Log entire jobs list for debugging
-        logger.debug(f"Raw jobs list: {jobs}")
-        
+
         for job_id, job_info in jobs.items():
-            # Ensure job_id is string for consistency
             job_id_str = str(job_id)
-            
-            # Create a basic job data structure regardless of categorization
-            job_data = {
-                'job_id': job_id_str,
-                'name': 'Unknown Job',
-                'start_time': None
-            }
-            
-            # Extract basic information if available 
-            if isinstance(job_info, dict):
-                job_data['name'] = job_info.get('name', 'Unknown Job')
-                job_data['start_time'] = job_info.get('start_time')
-                job_data['info'] = job_info.get('info', '')
-                
-                # Extract any datastore values
-                datastore = job_info.get('datastore', {})
-                if isinstance(datastore, dict):
-                    for key, value in datastore.items():
-                        job_data[key.lower()] = value
-            else:
-                logger.warning(f"Job {job_id_str} has non-dict job_info: {type(job_info)}")
-                job_data['raw_info'] = str(job_info)
-                # Still categorize non-dict jobs (don't skip)
-            
-            # Enhanced detection for handlers:
-            # 1. Look for obvious handler indicators
+            job_data = { 'job_id': job_id_str, 'name': 'Unknown', 'details': job_info } # Store raw info
+
             is_handler = False
-            
-            # Check name
-            if job_data.get('name') and isinstance(job_data['name'], str):
-                if 'exploit/multi/handler' in job_data['name'] or 'handler' in job_data['name'].lower():
-                    is_handler = True
-                    logger.debug(f"Job {job_id_str} identified as handler via name: {job_data['name']}")
-            
-            # Check info
-            if not is_handler and job_data.get('info') and isinstance(job_data['info'], str):
-                if 'exploit/multi/handler' in job_data['info'] or 'handler' in job_data['info'].lower():
-                    is_handler = True
-                    logger.debug(f"Job {job_id_str} identified as handler via info: {job_data['info']}")
-            
-            # Check raw job_info for strings if still not identified
-            if not is_handler and isinstance(job_info, dict):
-                # Convert the entire job_info to string and check if it contains handler indicators
-                job_info_str = str(job_info).lower()
-                if 'exploit/multi/handler' in job_info_str or 'handler' in job_info_str:
-                    is_handler = True
-                    logger.debug(f"Job {job_id_str} identified as handler via job_info string: {job_info_str[:100]}...")
-            
-            # 2. Check for payload-related fields that suggest a listener
-            if not is_handler:
-                # Handler jobs typically have payload/LHOST/LPORT settings
-                if 'payload' in job_data or 'lport' in job_data or 'lhost' in job_data:
-                    is_handler = True
-                    logger.debug(f"Job {job_id_str} identified as handler via payload-related fields")
-            
-            # 3. Last-resort check: look for specific module paths in any field
-            if not is_handler and isinstance(job_info, dict):
-                for key, value in job_info.items():
-                    if isinstance(value, str) and 'multi/handler' in value:
-                        is_handler = True
-                        logger.debug(f"Job {job_id_str} identified as handler via field {key}: {value}")
-                        break
-            
-            # Categorize based on detection result
+            if isinstance(job_info, dict):
+                 job_data['name'] = job_info.get('name', 'Unknown Job')
+                 job_data['start_time'] = job_info.get('start_time') # Keep if useful
+                 datastore = job_info.get('datastore', {})
+                 if isinstance(datastore, dict): job_data['datastore'] = datastore # Include datastore
+
+                 # Primary check: module path in name or info
+                 job_name_or_info = (job_info.get('name', '') + job_info.get('info', '')).lower()
+                 if 'exploit/multi/handler' in job_name_or_info:
+                     is_handler = True
+                 # Secondary check: presence of typical handler options
+                 elif 'payload' in datastore or ('lhost' in datastore and 'lport' in datastore):
+                     is_handler = True
+                     logger.debug(f"Job {job_id_str} identified as potential handler via datastore options.")
+
             if is_handler:
-                logger.info(f"Categorized job {job_id_str} as a handler: {job_data}")
-                handlers[job_id_str] = job_data
+                 logger.debug(f"Categorized job {job_id_str} as a handler.")
+                 handlers[job_id_str] = job_data
             else:
-                logger.debug(f"Categorized job {job_id_str} as non-handler: {job_data}")
-                other_jobs[job_id_str] = job_data
+                 logger.debug(f"Categorized job {job_id_str} as non-handler.")
+                 other_jobs[job_id_str] = job_data
 
-        # Fallback for uncategorized jobs:
-        # If we have jobs but no handlers are found, AND the total job count
-        # matches what we'd expect for handlers (e.g., when listening for connections)
-        # add them to a separate section in the response
-        uncategorized = {}
-        if len(handlers) == 0 and len(jobs) > 0:
-            logger.warning(f"No jobs categorized as handlers despite having {len(jobs)} total jobs. "
-                          "Jobs might be using unexpected formats or fields.")
-            for job_id, job_info in jobs.items():
-                job_id_str = str(job_id)
-                # Add raw job info for diagnostic purposes
-                if job_id_str not in other_jobs:
-                    if isinstance(job_info, dict):
-                        uncategorized[job_id_str] = {
-                            'job_id': job_id_str,
-                            'name': job_info.get('name', 'Unknown Job'),
-                            'raw_info': str(job_info)
-                        }
-                    else:
-                        uncategorized[job_id_str] = {
-                            'job_id': job_id_str,
-                            'name': 'Unknown',
-                            'raw_info': str(job_info)
-                        }
-
-        total_listed = len(handlers) + len(other_jobs)
-        total_reported = len(jobs)
-        if total_listed != total_reported:
-             logger.warning(f"Job count mismatch: Listed {total_listed} (H:{len(handlers)}, O:{len(other_jobs)}), Reported by MSF: {total_reported}")
-
-        response = {
+        return {
             "status": "success",
             "handlers": handlers,
             "other_jobs": other_jobs,
             "handler_count": len(handlers),
             "other_job_count": len(other_jobs),
-            "total_job_count": total_reported # Report count from MSF directly
+            "total_job_count": len(jobs)
         }
-        
-        # Include uncategorized jobs if we have any
-        if uncategorized:
-            response["uncategorized_jobs"] = uncategorized
-            response["uncategorized_count"] = len(uncategorized)
-            logger.warning(f"Including {len(uncategorized)} uncategorized jobs in response")
-            
-        return response
-        
+
     except MsfRpcError as e:
         logger.error(f"Error listing jobs/handlers: {e}")
-        return {"status": "error", "message": f"Error listing jobs: {str(e)}"}
+        return {"status": "error", "message": f"Error listing jobs: {e}"}
     except Exception as e:
         logger.exception("Unexpected error listing jobs/handlers.")
-        return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+        return {"status": "error", "message": f"Unexpected server error listing jobs: {e}"}
 
-
-# --- Rewritten start_listener using payload object ---
 @mcp.tool()
 async def start_listener(
     payload_type: str,
     lhost: str,
     lport: int,
-    additional_options: Optional[Dict[str, Any]] = None
+    additional_options: Optional[Dict[str, Any]] = None,
+    exit_on_session: bool = False # Option to keep listener running
 ) -> Dict[str, Any]:
     """
-    Start a new Metasploit handler (exploit/multi/handler) using the
-    recommended payload object method. Always runs as a job.
+    Start a new Metasploit handler (exploit/multi/handler) as a background job.
 
     Args:
         payload_type: The payload to handle (e.g., 'windows/meterpreter/reverse_tcp').
         lhost: Listener host address.
-        lport: Listener port.
-        additional_options: Optional dict of *payload* options (e.g., LURI for HTTP).
+        lport: Listener port (1-65535).
+        additional_options: Optional dict of additional payload options (e.g., LURI, HandlerSSLCert).
+        exit_on_session: If True, handler exits after first session. If False (default), it keeps running.
 
     Returns:
         Dictionary with handler status (job_id) or error details.
     """
-    global _msf_client_instance
-    if _msf_client_instance is None: return {"status": "error", "message": "MSF client not initialized."}
+    logger.info(f"Request to start listener for {payload_type} on {lhost}:{lport}. ExitOnSession: {exit_on_session}")
 
-    logger.info(f"Starting listener for {payload_type} on {lhost}:{lport} with options {additional_options}")
-    try:
-        if not all([isinstance(payload_type, str), isinstance(lhost, str), isinstance(lport, int)]):
-            return {"status": "error", "message": "Invalid input types for payload, lhost, or lport."}
-        if not (1 <= lport <= 65535):
-            return {"status": "error", "message": "Invalid LPORT."}
+    if not (1 <= lport <= 65535):
+        return {"status": "error", "message": "Invalid LPORT. Must be between 1 and 65535."}
 
-        # FIXED: Use the approach from run_exploit which works for multi/handler
-        module_name = "exploit/multi/handler"
-        base_module_name = module_name.replace('exploit/', '', 1)
-        
-        # Create handler module
-        module_obj = await asyncio.to_thread(lambda: _msf_client_instance.modules.use('exploit', base_module_name))
-        logger.debug(f"Retrieved handler module object")
-        
-        # Set non-payload specific handler options
-        await asyncio.to_thread(lambda: module_obj.__setitem__('ExitOnSession', False))
-        
-        # Prepare the payload options
-        payload_options = additional_options or {}
-        payload_options['LHOST'] = lhost
-        payload_options['LPORT'] = lport
-        
-        # Create and configure payload object
-        logger.debug(f"Preparing payload object '{payload_type}' with options")
-        payload_obj = await asyncio.to_thread(lambda: _msf_client_instance.modules.use('payload', payload_type))
-        
-        # Set payload options
-        for k, v in payload_options.items():
-            if isinstance(v, str):
-                if v.isdigit(): v = int(v)
-                elif v.lower() in ('true', 'false'): v = v.lower() == 'true'
-            await asyncio.to_thread(lambda key=k, value=v: payload_obj.__setitem__(key, value))
-            logger.debug(f"Set payload option {k}={v}")
-                
-        # Execute handler with payload
-        logger.info(f"Executing multi/handler module with payload object")
-        exec_result = await asyncio.to_thread(lambda: module_obj.execute(payload=payload_obj))
-        logger.info(f"Handler execution result: {exec_result}")
-        
-        # Process result
-        if isinstance(exec_result, dict) and 'job_id' in exec_result:
-            job_id = exec_result.get('job_id')
-            uuid = exec_result.get('uuid')
-            await asyncio.sleep(0.5) # Give job time to appear
-            
-            # Verify job exists
-            jobs_list = await asyncio.to_thread(lambda: _msf_client_instance.jobs.list)
-            if str(job_id) in jobs_list:
-                logger.info(f"Listener started successfully as job {job_id}.")
-                return {
-                    "status": "success", 
-                    "message": f"Listener started as job {job_id}", 
-                    "job_id": job_id, 
-                    "uuid": uuid, 
-                    "payload": payload_type, 
-                    "lhost": lhost, 
-                    "lport": lport
-                }
-            else:
-                logger.warning(f"Handler execution reported job ID {job_id}, but job not found in list immediately.")
-                return {
-                    "status": "warning", 
-                    "message": f"Listener job {job_id} reported but not immediately found. It might still be starting.", 
-                    "job_id": job_id, 
-                    "uuid": uuid
-                }
-        else:
-            # Check for specific error messages
-            error_message = f"Failed to start listener. Result: {exec_result}"
-            if isinstance(exec_result, dict):
-                if 'error' in exec_result and exec_result['error']:
-                     error_message = f"Failed to start listener: {exec_result.get('error_message', exec_result.get('error_string', 'Unknown error'))}"
-                elif 'error_message' in exec_result:
-                     error_message = f"Failed to start listener: {exec_result['error_message']}"
-            logger.error(error_message)
-            return {"status": "error", "message": error_message}
+    # exploit/multi/handler options
+    module_options = {'ExitOnSession': exit_on_session}
+    # Payload options (passed within the payload_spec)
+    payload_options = additional_options or {}
+    payload_options['LHOST'] = lhost
+    payload_options['LPORT'] = lport
 
-    except MsfRpcError as e:
-        if "Invalid Payload" in str(e):
-             logger.error(f"Invalid payload type specified: {payload_type}")
-             return {"status": "error", "message": f"Invalid payload type: {payload_type}"}
-        logger.error(f"MsfRpcError starting listener: {e}")
-        return {"status": "error", "message": f"Error starting listener: {str(e)}"}
-    except Exception as e:
-        logger.exception("Unexpected error starting listener")
-        return {"status": "error", "message": f"Unexpected error starting listener: {str(e)}"}
+    payload_spec = {"name": payload_type, "options": payload_options}
 
+    # Use the RPC helper to start the handler job
+    result = await _execute_module_rpc(
+        module_type='exploit',
+        module_name='multi/handler', # Use base name for helper
+        module_options=module_options,
+        payload_spec=payload_spec
+    )
 
-# --- Fixed stop_job handling string return ---
+    # Rename status/message slightly for clarity
+    if result.get("status") == "success":
+         result["message"] = f"Listener for {payload_type} started as job {result.get('job_id')} on {lhost}:{lport}."
+    elif result.get("status") == "warning": # e.g., job started but polling failed (not applicable here but handle)
+         result["message"] = f"Listener job {result.get('job_id')} started, but encountered issues: {result.get('message')}"
+    else: # Error case
+         result["message"] = f"Failed to start listener: {result.get('message')}"
+
+    return result
+
 @mcp.tool()
 async def stop_job(job_id: int) -> Dict[str, Any]:
     """
-    Stop a running Metasploit job (handler or other).
-    Handles string return value from jobs.stop().
+    Stop a running Metasploit job (handler or other). Verifies disappearance.
     """
-    global _msf_client_instance
-    if _msf_client_instance is None: return {"status": "error", "message": "MSF client not initialized."}
-
+    client = get_msf_client()
     logger.info(f"Attempting to stop job {job_id}")
     job_id_str = str(job_id)
-    job_name = "Unknown" # Default name
+    job_name = "Unknown"
 
     try:
-        # Check if job exists before trying to stop
-        jobs_before = await asyncio.to_thread(lambda: _msf_client_instance.jobs.list)
+        # Check if job exists and get name
+        jobs_before = await asyncio.to_thread(lambda: client.jobs.list)
         if job_id_str not in jobs_before:
             logger.error(f"Job {job_id} not found, cannot stop.")
             return {"status": "error", "message": f"Job {job_id} not found."}
-        
-        # Try to get job name for better reporting
         if isinstance(jobs_before.get(job_id_str), dict):
-            job_name = jobs_before[job_id_str].get('name', 'Unknown Job')
+             job_name = jobs_before[job_id_str].get('name', 'Unknown Job')
 
         # Attempt to stop the job
         logger.debug(f"Calling jobs.stop({job_id_str})")
-        stop_result = await asyncio.to_thread(lambda: _msf_client_instance.jobs.stop(job_id_str))
-        logger.debug(f"jobs.stop({job_id_str}) API call returned: {stop_result} (type: {type(stop_result)})")
+        stop_result_str = await asyncio.to_thread(lambda: client.jobs.stop(job_id_str))
+        logger.debug(f"jobs.stop() API call returned: {stop_result_str}")
 
-        # Handle the result from jobs.stop()
-        # In pymetasploit3, this returns a string with a success/error message
-        if isinstance(stop_result, str):
-            logger.info(f"jobs.stop() returned string: '{stop_result}'")
-            if 'success' in stop_result.lower():
-                logger.info(f"Successfully stopped job {job_id} based on return string")
-                return {
-                    "status": "success", 
-                    "message": f"Successfully stopped job {job_id}", 
-                    "job_id": job_id, 
-                    "job_name": job_name,
-                    "api_result": stop_result
-                }
-            elif 'error' in stop_result.lower() or 'invalid' in stop_result.lower() or 'failed' in stop_result.lower():
-                logger.error(f"Failed to stop job {job_id} based on return string: {stop_result}")
-                return {
-                    "status": "error", 
-                    "message": f"Failed to stop job {job_id}: {stop_result}", 
-                    "job_id": job_id, 
-                    "job_name": job_name,
-                    "api_result": stop_result
-                }
-
-        # Verify job stopped regardless of return value
-        await asyncio.sleep(1.0) # Give MSF more time to process stop
-        jobs_after = await asyncio.to_thread(lambda: _msf_client_instance.jobs.list)
+        # Verify job stopped by checking list again
+        await asyncio.sleep(1.0) # Give MSF time to process stop
+        jobs_after = await asyncio.to_thread(lambda: client.jobs.list)
         job_stopped = job_id_str not in jobs_after
 
-        # Determine success based on disappearance of job
         if job_stopped:
-            logger.info(f"Successfully stopped job {job_id} ('{job_name}') - verified by job disappearance")
+            logger.info(f"Successfully stopped job {job_id} ('{job_name}') - verified by disappearance")
             return {
-                "status": "success", 
-                "message": f"Successfully stopped job {job_id}", 
-                "job_id": job_id, 
+                "status": "success",
+                "message": f"Successfully stopped job {job_id} ('{job_name}')",
+                "job_id": job_id,
                 "job_name": job_name,
-                "api_result": str(stop_result)  # Include result for consistency
+                "api_result": stop_result_str
             }
         else:
-            # Job didn't disappear and API result wasn't clearly success
-            logger.error(f"Failed to stop job {job_id}. Job still present after stop attempt.")
+            # Job didn't disappear. The API result string might give a hint, but is unreliable.
+            logger.error(f"Failed to stop job {job_id}. Job still present after stop attempt. API result: '{stop_result_str}'")
             return {
-                "status": "error", 
-                "message": f"Failed to stop job {job_id}. Job still running after stop attempt.", 
+                "status": "error",
+                "message": f"Failed to stop job {job_id}. Job may still be running. API result: '{stop_result_str}'",
                 "job_id": job_id,
-                "api_result": str(stop_result)  # Ensure we convert non-string results to string
+                "job_name": job_name,
+                "api_result": stop_result_str
             }
 
     except MsfRpcError as e:
         logger.error(f"MsfRpcError stopping job {job_id}: {e}")
-        return {"status": "error", "message": f"Error stopping job {job_id}: {str(e)}"}
+        return {"status": "error", "message": f"Error stopping job {job_id}: {e}"}
     except Exception as e:
         logger.exception(f"Unexpected error stopping job {job_id}.")
-        return {"status": "error", "message": f"Unexpected error stopping job {job_id}: {str(e)}"}
-
+        return {"status": "error", "message": f"Unexpected server error stopping job {job_id}: {e}"}
 
 @mcp.tool()
-async def execute_local_program(program_path: str) -> Dict[str, Any]:
+async def terminate_session(session_id: int) -> Dict[str, Any]:
     """
-    Execute a program at the specified local path.
-    
-    This function attempts to execute arbitrary files on your local system.
-    Only use it with files you have created and trust (e.g., payloads you generated).
+    Forcefully terminate a Metasploit session using the session.stop() method.
     
     Args:
-        program_path: Full path to the program to execute (typically a path returned by generate_payload)
+        session_id: ID of the session to terminate.
         
     Returns:
-        Dictionary with execution status and details
+        Dictionary with status and result message.
     """
-    logger.info(f"Attempting to execute local program: {program_path}")
+    client = get_msf_client()
+    session_id_str = str(session_id)
+    logger.info(f"Terminating session {session_id}")
     
-    # Validate path exists and is a file
-    if not os.path.exists(program_path):
-        logger.error(f"Path does not exist: {program_path}")
-        return {
-            "status": "error", 
-            "message": "Invalid path: File does not exist.", 
-            "path_checked": program_path
-        }
-    
-    if not os.path.isfile(program_path):
-        logger.error(f"Path is not a file: {program_path}")
-        return {
-            "status": "error", 
-            "message": "Invalid path: Not a file.", 
-            "path_checked": program_path
-        }
-    
-    # Attempt to execute the program
     try:
-        # Use subprocess.Popen to launch the program asynchronously without blocking
-        await asyncio.to_thread(subprocess.Popen, [program_path])
+        # Check if session exists
+        current_sessions = await asyncio.to_thread(lambda: client.sessions.list)
+        if session_id_str not in current_sessions:
+            logger.error(f"Session {session_id} not found.")
+            return {"status": "error", "message": f"Session {session_id} not found."}
+            
+        # Get a handle to the session
+        session = await asyncio.to_thread(lambda: client.sessions.session(session_id_str))
         
-        logger.info(f"Successfully launched program: {program_path}")
-        return {
-            "status": "success",
-            "message": f"Attempted to launch program in the background: {program_path}"
-        }
-    except FileNotFoundError as e:
-        logger.error(f"FileNotFoundError executing {program_path}: {e}")
-        return {
-            "status": "error",
-            "message": "Failed to launch program: File not found.",
-            "path_attempted": program_path,
-            "error_details": str(e)
-        }
-    except PermissionError as e:
-        logger.error(f"PermissionError executing {program_path}: {e}")
-        return {
-            "status": "error",
-            "message": "Failed to launch program: Permission denied.",
-            "path_attempted": program_path,
-            "error_details": str(e)
-        }
-    except OSError as e:
-        logger.error(f"OSError executing {program_path}: {e}")
-        return {
-            "status": "error",
-            "message": "Failed to launch program: OS error.",
-            "path_attempted": program_path,
-            "error_details": str(e)
-        }
+        # Stop the session
+        await asyncio.to_thread(lambda: session.stop())
+        
+        # Verify termination
+        await asyncio.sleep(1.0)  # Give MSF time to process termination
+        current_sessions_after = await asyncio.to_thread(lambda: client.sessions.list)
+        
+        if session_id_str not in current_sessions_after:
+            logger.info(f"Successfully terminated session {session_id}")
+            return {"status": "success", "message": f"Session {session_id} terminated successfully."}
+        else:
+            logger.warning(f"Session {session_id} still appears in the sessions list after termination attempt.")
+            return {"status": "warning", "message": f"Session {session_id} may not have been terminated properly."}
+            
+    except MsfRpcError as e:
+        logger.error(f"MsfRpcError terminating session {session_id}: {e}")
+        return {"status": "error", "message": f"Error terminating session {session_id}: {e}"}
     except Exception as e:
-        logger.exception(f"Unexpected error executing {program_path}")
-        return {
-            "status": "error",
-            "message": "Failed to launch program due to an unexpected error.",
-            "path_attempted": program_path,
-            "error_details": str(e)
-        }
-
+        logger.exception(f"Unexpected error terminating session {session_id}")
+        return {"status": "error", "message": f"Unexpected error terminating session {session_id}: {e}"}
 
 # --- FastAPI Application Setup ---
+
 app = FastAPI(
-    title="Metasploit MCP Server",
-    description="Provides Metasploit functionality via the Model Context Protocol.",
-    version="1.4.0", # Incremented version for fixes
-    lifespan=None # Lifespan context manager removed as not strictly needed here
+    title="Metasploit MCP Server (Streamlined)",
+    description="Provides core Metasploit functionality via the Model Context Protocol.",
+    version="1.6.0", # Incremented version
 )
+
+# Setup MCP transport (SSE for HTTP mode)
 sse = SseServerTransport("/messages/")
-# Manually add the route for POST to /messages/
+# Manually add the route for POST to /messages/ (needed for FastMCP+FastAPI)
 app.router.routes.append(Mount("/messages", app=Starlette(routes=[
     Route("/", endpoint=sse.handle_post_message, methods=["POST"])
 ])))
 
-
 @app.get("/sse", tags=["MCP"])
-async def handle_sse_connection(request: Request): # Renamed for clarity
+async def handle_sse_connection(request: Request):
     """Handle Server-Sent Events connection for MCP communication."""
+    logger.info(f"New SSE connection from {request.client.host}:{request.client.port}")
     async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
         await mcp._mcp_server.run(read_stream, write_stream, mcp._mcp_server.create_initialization_options())
+    logger.info(f"SSE connection closed from {request.client.host}:{request.client.port}")
 
 @app.get("/healthz", tags=["Health"])
 async def health_check():
     """Check connectivity to the Metasploit RPC service."""
-    global _msf_client_instance
-    if _msf_client_instance is None:
-        raise HTTPException(status_code=503, detail="Metasploit client not initialized.")
     try:
+        client = get_msf_client() # Will raise ConnectionError if not init
         logger.debug("Executing health check MSF call (core.version)...")
-        # Use a lightweight call like core.version for health check
-        version_info = await asyncio.to_thread(lambda: _msf_client_instance.core.version)
+        # Use a lightweight call like core.version
+        version_info = await asyncio.to_thread(lambda: client.core.version)
         msf_version = version_info.get('version', 'N/A') if isinstance(version_info, dict) else 'N/A'
         logger.info(f"Health check successful. MSF Version: {msf_version}")
         return {"status": "ok", "msf_version": msf_version}
@@ -1814,49 +1420,48 @@ async def health_check():
         logger.exception("Unexpected error during health check.")
         raise HTTPException(status_code=500, detail=f"Internal Server Error during health check: {e}")
 
-# --- Server Startup ---
+# --- Server Startup Logic ---
+
+def find_available_port(start_port, host='127.0.0.1', max_attempts=10):
+    """Finds an available TCP port."""
+    for port in range(start_port, start_port + max_attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, port))
+                logger.debug(f"Port {port} on {host} is available.")
+                return port
+            except socket.error:
+                logger.debug(f"Port {port} on {host} is in use, trying next.")
+                continue
+    logger.warning(f"Could not find available port in range {start_port}-{start_port+max_attempts-1} on {host}. Using default {start_port}.")
+    return start_port
+
 if __name__ == "__main__":
+    # Initialize MSF Client - Critical for server function
     try:
-        initialize_msf_client() # Attempt connection on startup
+        initialize_msf_client()
     except (ValueError, ConnectionError, RuntimeError) as e:
         logger.critical(f"CRITICAL: Failed to initialize Metasploit client on startup: {e}. Server cannot function.")
-        import sys
         sys.exit(1) # Exit if MSF connection fails at start
 
-    import argparse
-    import socket
-    import sys
-
-    # Determine if running under Claude Desktop's stdio mode
-    is_claude_stdio = not sys.stdin.isatty() if hasattr(sys.stdin, 'isatty') else False
+    # Determine launch mode (stdio for Claude Desktop, HTTP otherwise)
+    is_claude_stdio = hasattr(sys.stdin, 'isatty') and not sys.stdin.isatty()
 
     if is_claude_stdio:
         logger.info("Detected non-interactive stdin. Assuming Claude Desktop launch. Using stdio transport.")
-        # Run MCP server over stdio
+        # Run MCP server over stdio (synchronous call)
         try:
-            # Note: mcp.run is synchronous, might block async tasks if not careful
-            # Consider running FastAPI/uvicorn in a separate thread/process if needed
-            # alongside stdio transport in more complex scenarios.
-            mcp.run(transport="stdio")
+            mcp.run(transport="stdio") # FastMCP handles async tools within its run loop
         except Exception as e:
              logger.exception("Error during MCP stdio run loop.")
+             sys.exit(1)
+        logger.info("MCP stdio server finished.")
     else:
-        logger.info("Detected interactive terminal. Starting HTTP server.")
+        logger.info("Detected interactive terminal or non-stdio launch. Starting HTTP server.")
         # --- HTTP Server Setup ---
-        def find_available_port(start_port, host='0.0.0.0', max_attempts=10):
-            for port in range(start_port, start_port + max_attempts):
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    try:
-                        s.bind((host, port))
-                        logger.debug(f"Port {port} on {host} is available.")
-                        return port
-                    except socket.error as e:
-                        logger.debug(f"Port {port} on {host} is in use ({e}), trying next.")
-                        continue
-            logger.warning(f"Could not find available port in range {start_port}-{start_port+max_attempts-1} on {host}. Using default {start_port}.")
-            return start_port
+        import argparse
 
-        parser = argparse.ArgumentParser(description='Run Improved Metasploit MCP Server (HTTP Mode)')
+        parser = argparse.ArgumentParser(description='Run Streamlined Metasploit MCP Server (HTTP Mode)')
         parser.add_argument('--host', default='127.0.0.1', help='Host to bind the HTTP server to (default: 127.0.0.1)')
         parser.add_argument('--port', type=int, default=None, help='Port to listen on (default: find available from 8085)')
         parser.add_argument('--reload', action='store_true', help='Enable auto-reload (for development)')
@@ -1869,8 +1474,10 @@ if __name__ == "__main__":
             selected_port = find_available_port(start_port, host=args.host)
 
         logger.info(f"Starting Uvicorn HTTP server on http://{args.host}:{selected_port}")
+        logger.info(f"MCP SSE Endpoint: /sse")
+        logger.info(f"API Docs available at http://{args.host}:{selected_port}/docs")
+        logger.info(f"Payload Save Directory: {PAYLOAD_SAVE_DIR}")
         logger.info(f"Auto-reload: {'Enabled' if args.reload else 'Disabled'}")
-        logger.info("API Docs available at http://{args.host}:{selected_port}/docs")
 
         uvicorn.run(
             "__main__:app", # Point to the app object in the current file
