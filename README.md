@@ -65,6 +65,30 @@ Start the Metasploit RPC service:
 msfrpcd -P yourpassword -S -a 127.0.0.1 -p 55553
 ```
 
+### Transport Options
+
+The server supports two transport methods:
+
+- **HTTP/SSE (Server-Sent Events)**: Default mode for interoperability with most MCP clients
+- **STDIO (Standard Input/Output)**: Used with Claude Desktop and similar direct pipe connections
+
+You can explicitly select the transport mode using the `--transport` flag:
+
+```bash
+# Run with HTTP/SSE transport (default)
+python MetasploitMCP.py --transport http
+
+# Run with STDIO transport
+python MetasploitMCP.py --transport stdio
+```
+
+Additional options for HTTP mode:
+```bash
+python MetasploitMCP.py --transport http --host 0.0.0.0 --port 8085
+```
+
+### Claude Desktop Integration
+
 For Claude Desktop integration, configure `claude_desktop_config.json`:
 
 ```json
@@ -76,7 +100,9 @@ For Claude Desktop integration, configure `claude_desktop_config.json`:
                 "--directory",
                 "C:\\path\\to\\MetasploitMCP",
                 "run",
-                "MetasploitMCP.py"
+                "MetasploitMCP.py",
+                "--transport",
+                "stdio"
             ],
             "env": {
                 "MSF_PASSWORD": "yourpassword"
@@ -85,6 +111,18 @@ For Claude Desktop integration, configure `claude_desktop_config.json`:
     }
 }
 ```
+
+### Other MCP Clients
+
+For other MCP clients that use HTTP/SSE:
+
+1. Start the server in HTTP mode:
+   ```bash
+   python MetasploitMCP.py --transport http --host 0.0.0.0 --port 8085
+   ```
+
+2. Configure your MCP client to connect to:
+   - SSE endpoint: `http://your-server-ip:8085/sse`
 
 ## Security Considerations
 

@@ -1389,10 +1389,7 @@ app = FastAPI(
 
 # Setup MCP transport (SSE for HTTP mode)
 sse = SseServerTransport("/messages/")
-# Manually add the route for POST to /messages/ (needed for FastMCP+FastAPI)
-app.router.routes.append(Mount("/messages", app=Starlette(routes=[
-    Route("/", endpoint=sse.handle_post_message, methods=["POST"])
-])))
+# DO NOT manually add routes for /messages - it's handled internally by SseServerTransport
 
 @app.get("/sse", tags=["MCP"])
 async def handle_sse_connection(request: Request):
@@ -1444,34 +1441,39 @@ if __name__ == "__main__":
         logger.critical(f"CRITICAL: Failed to initialize Metasploit client on startup: {e}. Server cannot function.")
         sys.exit(1) # Exit if MSF connection fails at start
 
-    # Determine launch mode (stdio for Claude Desktop, HTTP otherwise)
-    is_claude_stdio = hasattr(sys.stdin, 'isatty') and not sys.stdin.isatty()
+    # --- Setup argument parser for transport mode and server configuration ---
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Run Streamlined Metasploit MCP Server')
+    parser.add_argument(
+        '--transport', 
+        choices=['http', 'stdio'], 
+        default='http',
+        help='MCP transport mode to use (http=SSE, stdio=direct pipe)'
+    )
+    parser.add_argument('--host', default='127.0.0.1', help='Host to bind the HTTP server to (default: 127.0.0.1)')
+    parser.add_argument('--port', type=int, default=None, help='Port to listen on (default: find available from 8085)')
+    parser.add_argument('--reload', action='store_true', help='Enable auto-reload (for development)')
+    parser.add_argument('--find-port', action='store_true', help='Force finding an available port starting from --port or 8085')
+    args = parser.parse_args()
 
-    if is_claude_stdio:
-        logger.info("Detected non-interactive stdin. Assuming Claude Desktop launch. Using stdio transport.")
-        # Run MCP server over stdio (synchronous call)
+    if args.transport == 'stdio':
+        logger.info("Starting MCP server in STDIO transport mode.")
         try:
-            mcp.run(transport="stdio") # FastMCP handles async tools within its run loop
+            mcp.run(transport="stdio")
         except Exception as e:
-             logger.exception("Error during MCP stdio run loop.")
-             sys.exit(1)
+            logger.exception("Error during MCP stdio run loop.")
+            sys.exit(1)
         logger.info("MCP stdio server finished.")
-    else:
-        logger.info("Detected interactive terminal or non-stdio launch. Starting HTTP server.")
-        # --- HTTP Server Setup ---
-        import argparse
-
-        parser = argparse.ArgumentParser(description='Run Streamlined Metasploit MCP Server (HTTP Mode)')
-        parser.add_argument('--host', default='127.0.0.1', help='Host to bind the HTTP server to (default: 127.0.0.1)')
-        parser.add_argument('--port', type=int, default=None, help='Port to listen on (default: find available from 8085)')
-        parser.add_argument('--reload', action='store_true', help='Enable auto-reload (for development)')
-        parser.add_argument('--find-port', action='store_true', help='Force finding an available port starting from --port or 8085')
-        args = parser.parse_args()
-
+    else:  # HTTP/SSE mode (default)
+        logger.info("Starting MCP server in HTTP/SSE transport mode.")
+        
+        # Check port availability
+        check_host = args.host if args.host != '0.0.0.0' else '127.0.0.1'
         selected_port = args.port
         if selected_port is None or args.find_port:
             start_port = selected_port if selected_port is not None else 8085
-            selected_port = find_available_port(start_port, host=args.host)
+            selected_port = find_available_port(start_port, host=check_host)
 
         logger.info(f"Starting Uvicorn HTTP server on http://{args.host}:{selected_port}")
         logger.info(f"MCP SSE Endpoint: /sse")
@@ -1480,9 +1482,9 @@ if __name__ == "__main__":
         logger.info(f"Auto-reload: {'Enabled' if args.reload else 'Disabled'}")
 
         uvicorn.run(
-            "__main__:app", # Point to the app object in the current file
+            "__main__:app",
             host=args.host,
             port=selected_port,
             reload=args.reload,
-            log_level="info" # Use Uvicorn's logging for server events
+            log_level="info"
         )
