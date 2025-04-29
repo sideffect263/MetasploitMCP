@@ -15,12 +15,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 # --- Third-party Libraries ---
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from pymetasploit3.msfrpc import MsfConsole, MsfRpcClient, MsfRpcError
 from starlette.applications import Starlette
-from starlette.routing import Mount, Route
+from starlette.routing import Mount, Route, Router
 
 # --- Configuration & Constants ---
 
@@ -1390,19 +1390,33 @@ app = FastAPI(
 # Setup MCP transport (SSE for HTTP mode)
 sse = SseServerTransport("/messages/")
 
-@app.get("/sse", tags=["MCP"])
-async def handle_sse_connection(request: Request):
-    """Handle Server-Sent Events connection for MCP communication."""
-    logger.info(f"New SSE connection from {request.client.host}:{request.client.port}")
-    async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
-        await mcp._mcp_server.run(read_stream, write_stream, mcp._mcp_server.create_initialization_options())
-    logger.info(f"SSE connection closed from {request.client.host}:{request.client.port}")
+# Define ASGI handlers properly with Starlette's ASGIApp interface
+class SseEndpoint:
+    async def __call__(self, scope, receive, send):
+        """Handle Server-Sent Events connection for MCP communication."""
+        client_host = scope.get('client')[0] if scope.get('client') else 'unknown'
+        client_port = scope.get('client')[1] if scope.get('client') else 'unknown'
+        logger.info(f"New SSE connection from {client_host}:{client_port}")
+        async with sse.connect_sse(scope, receive, send) as (read_stream, write_stream):
+            await mcp._mcp_server.run(read_stream, write_stream, mcp._mcp_server.create_initialization_options())
+        logger.info(f"SSE connection closed from {client_host}:{client_port}")
 
-@app.post("/messages/", tags=["MCP"])
-async def handle_post_message(request: Request):
-    """Handle client POST messages for MCP communication."""
-    logger.info(f"Received POST message from {request.client.host}:{request.client.port}")
-    return await sse.handle_post_message(request.scope, request.receive, request._send)
+class MessagesEndpoint:
+    async def __call__(self, scope, receive, send):
+        """Handle client POST messages for MCP communication."""
+        client_host = scope.get('client')[0] if scope.get('client') else 'unknown'
+        client_port = scope.get('client')[1] if scope.get('client') else 'unknown'
+        logger.info(f"Received POST message from {client_host}:{client_port}")
+        await sse.handle_post_message(scope, receive, send)
+
+# Create routes using the ASGIApp-compliant classes
+mcp_router = Router([
+    Route("/sse", endpoint=SseEndpoint(), methods=["GET"]),
+    Route("/messages/", endpoint=MessagesEndpoint(), methods=["POST"]),
+])
+
+# Mount the MCP router to the main app
+app.routes.append(Mount("/", app=mcp_router))
 
 @app.get("/healthz", tags=["Health"])
 async def health_check():
