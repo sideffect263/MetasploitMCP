@@ -1389,7 +1389,6 @@ app = FastAPI(
 
 # Setup MCP transport (SSE for HTTP mode)
 sse = SseServerTransport("/messages/")
-# DO NOT manually add routes for /messages - it's handled internally by SseServerTransport
 
 @app.get("/sse", tags=["MCP"])
 async def handle_sse_connection(request: Request):
@@ -1398,6 +1397,12 @@ async def handle_sse_connection(request: Request):
     async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
         await mcp._mcp_server.run(read_stream, write_stream, mcp._mcp_server.create_initialization_options())
     logger.info(f"SSE connection closed from {request.client.host}:{request.client.port}")
+
+@app.post("/messages/", tags=["MCP"])
+async def handle_post_message(request: Request):
+    """Handle client POST messages for MCP communication."""
+    logger.info(f"Received POST message from {request.client.host}:{request.client.port}")
+    return await sse.handle_post_message(request.scope, request.receive, request._send)
 
 @app.get("/healthz", tags=["Health"])
 async def health_check():
