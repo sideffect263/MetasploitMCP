@@ -2,6 +2,10 @@
 
 A Model Context Protocol (MCP) server for Metasploit Framework integration.
 
+
+https://github.com/user-attachments/assets/39b19fb5-8397-4ccd-b896-d1797ec185e1
+
+
 ## Description
 
 This MCP server provides a bridge between large language models like Claude and the Metasploit Framework penetration testing platform. It allows AI assistants to dynamically access and control Metasploit functionality through standardized tools, enabling a natural language interface to complex security testing workflows.
