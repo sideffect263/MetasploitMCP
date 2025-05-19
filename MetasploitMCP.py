@@ -695,25 +695,37 @@ async def generate_payload(
         # Set payload-specific required options (like LHOST/LPORT)
         await _set_module_options(payload, options)
 
-        # Prepare generation options dictionary for payload.generate()
-        gen_opts = {
-            'Format': format_type,
-            'Encoder': encoder,
-            'Iterations': iterations,
-            'BadChars': bad_chars,
-            'NopSledSize': nop_sled_size,
-            'Template': template_path,
-            'KeepTemplateWorking': keep_template,
-            'ForceEncode': force_encode,
-        }
-        # Filter out None/empty/default values to avoid passing unnecessary options
-        gen_opts_filtered = {k: v for k, v in gen_opts.items() if v is not None and v != '' and v != 0 and v is not False}
-        logger.debug(f"Payload generation options: {gen_opts_filtered}")
-
-        # Generate the payload bytes using payload.generate()
-        logger.info("Calling payload.generate()...")
-        # payload.generate() takes the options dict as an argument
-        raw_payload_bytes = await asyncio.to_thread(lambda: payload.generate(gen_opts_filtered))
+        # Set payload generation options in payload.runoptions
+        # as per the pymetasploit3 documentation
+        logger.info("Setting payload generation options in payload.runoptions...")
+        
+        # Define a function to update an individual runoption
+        async def update_runoption(key, value):
+            if value is None:
+                return
+            await asyncio.to_thread(lambda k=key, v=value: payload.runoptions.__setitem__(k, v))
+            logger.debug(f"Set runoption {key}={value}")
+        
+        # Set generation options individually
+        await update_runoption('Format', format_type)
+        if encoder:
+            await update_runoption('Encoder', encoder)
+        if iterations:
+            await update_runoption('Iterations', iterations) 
+        if bad_chars is not None:
+            await update_runoption('BadChars', bad_chars)
+        if nop_sled_size:
+            await update_runoption('NopSledSize', nop_sled_size)
+        if template_path:
+            await update_runoption('Template', template_path)
+        if keep_template:
+            await update_runoption('KeepTemplateWorking', keep_template)
+        if force_encode:
+            await update_runoption('ForceEncode', force_encode)
+        
+        # Generate the payload bytes using payload.payload_generate()
+        logger.info("Calling payload.payload_generate()...")
+        raw_payload_bytes = await asyncio.to_thread(lambda: payload.payload_generate())
 
         if not isinstance(raw_payload_bytes, bytes):
             error_msg = f"Payload generation failed. Expected bytes, got {type(raw_payload_bytes)}: {str(raw_payload_bytes)[:200]}"
@@ -773,7 +785,7 @@ async def generate_payload(
                 "payload_size": payload_size, "format": format_type
             }
 
-    except (ValueError, MsfRpcError) as e: # Catches errors from _get_module_object, _set_module_options, or generate
+    except (ValueError, MsfRpcError) as e: # Catches errors from _get_module_object, _set_module_options
         error_str = str(e).lower()
         logger.error(f"Error generating payload {payload_type}: {e}")
         if "invalid payload type" in error_str or "unknown module" in error_str:
@@ -782,6 +794,11 @@ async def generate_payload(
              missing = getattr(payload, 'missing_required', []) if 'payload' in locals() else []
              return {"status": "error", "message": f"Missing/invalid options for payload {payload_type}: {e}", "missing_required": missing}
         return {"status": "error", "message": f"Error generating payload: {e}"}
+    except AttributeError as e: # Specifically catch if payload_generate is missing
+        logger.exception(f"AttributeError during payload generation for '{payload_type}': {e}")
+        if "object has no attribute 'payload_generate'" in str(e):
+            return {"status": "error", "message": f"The pymetasploit3 payload module doesn't have the payload_generate method. Please check library version/compatibility."}
+        return {"status": "error", "message": f"An attribute error occurred: {e}"}
     except Exception as e:
         logger.exception(f"Unexpected error during payload generation for '{payload_type}'.")
         return {"status": "error", "message": f"An unexpected server error occurred during payload generation: {e}"}
