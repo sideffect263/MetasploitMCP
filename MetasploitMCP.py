@@ -20,6 +20,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from pymetasploit3.msfrpc import MsfConsole, MsfRpcClient, MsfRpcError
 from starlette.applications import Starlette
+from starlette.responses import HTMLResponse # Added for serving HTML
 from starlette.routing import Mount, Route, Router
 
 # --- Configuration & Constants ---
@@ -1404,8 +1405,8 @@ app = FastAPI(
     version="1.6.0", # Incremented version
 )
 
-# Setup MCP transport (SSE for HTTP mode)
-sse = SseServerTransport("/messages/")
+# Setup MCP transport (SSE for HTTP mode) - Updated path
+sse = SseServerTransport("/mcp/messages/")
 
 @app.get("/healthz", tags=["Health"])
 async def health_check():
@@ -1424,6 +1425,20 @@ async def health_check():
     except Exception as e:
         logger.exception("Unexpected error during health check.")
         raise HTTPException(status_code=500, detail=f"Internal Server Error during health check: {e}")
+
+@app.get("/", response_class=HTMLResponse, tags=["Documentation"])
+async def get_documentation():
+    """Serves the main documentation page."""
+    try:
+        with open("index.html", "r", encoding="utf-8") as f:
+            html_content = f.read()
+        return HTMLResponse(content=html_content)
+    except FileNotFoundError:
+        logger.error("index.html not found.")
+        raise HTTPException(status_code=404, detail="Documentation file not found.")
+    except Exception as e:
+        logger.exception("Error reading documentation file.")
+        raise HTTPException(status_code=500, detail="Internal server error serving documentation.")
 
 # Define ASGI handlers properly with Starlette's ASGIApp interface
 class SseEndpoint:
@@ -1444,15 +1459,15 @@ class MessagesEndpoint:
         logger.info(f"Received POST message from {client_host}:{client_port}")
         await sse.handle_post_message(scope, receive, send)
 
-# Create routes using the ASGIApp-compliant classes
+# Create routes using the ASGIApp-compliant classes - Updated paths
 mcp_router = Router([
-    Route("/sse", endpoint=SseEndpoint(), methods=["GET"]),
-    Route("/messages/", endpoint=MessagesEndpoint(), methods=["POST"]),
+    Route("/sse", endpoint=SseEndpoint(), methods=["GET"]),      # Path relative to the mount point
+    Route("/messages/", endpoint=MessagesEndpoint(), methods=["POST"]), # Path relative to the mount point
 ])
 
-# Mount the MCP router to the main app
-# This should come after other specific routes like /healthz are defined on 'app'
-app.routes.append(Mount("/", app=mcp_router))
+# Mount the MCP router to the main app under /mcp/ prefix
+# This should come after other specific routes like /healthz and / are defined on 'app'
+app.routes.append(Mount("/mcp", app=mcp_router)) # MCP endpoints are now under /mcp/
 
 # --- Server Startup Logic ---
 
@@ -1513,7 +1528,8 @@ if __name__ == "__main__":
             selected_port = find_available_port(start_port, host=check_host)
 
         logger.info(f"Starting Uvicorn HTTP server on http://{args.host}:{selected_port}")
-        logger.info(f"MCP SSE Endpoint: /sse")
+        logger.info(f"Documentation available at http://{args.host}:{selected_port}/") # Updated
+        logger.info(f"MCP SSE Endpoint: /mcp/sse") # Updated
         logger.info(f"API Docs available at http://{args.host}:{selected_port}/docs")
         logger.info(f"Payload Save Directory: {PAYLOAD_SAVE_DIR}")
         logger.info(f"Auto-reload: {'Enabled' if args.reload else 'Disabled'}")
