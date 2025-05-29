@@ -809,7 +809,7 @@ async def run_exploit(
     options: Dict[str, Any],
     payload_name: Optional[str] = None,
     payload_options: Optional[Dict[str, Any]] = None,
-    run_as_job: bool = True,
+    run_as_job: bool = False,
     check_vulnerability: bool = False, # New option
     timeout_seconds: int = LONG_CONSOLE_READ_TIMEOUT # Used only if run_as_job=False
 ) -> Dict[str, Any]:
@@ -822,7 +822,7 @@ async def run_exploit(
         options: Dictionary of exploit module options (e.g., {'RHOSTS': '192.168.1.1'}).
         payload_name: Name of the payload (e.g., 'linux/x86/meterpreter/reverse_tcp').
         payload_options: Dictionary of payload options (e.g., {'LHOST': '...', 'LPORT': ...}).
-        run_as_job: If True (default), run async via RPC. If False, run sync via console.
+        run_as_job: If False (default), run sync via console. If True, run async via RPC.
         check_vulnerability: If True, run module's 'check' action first (if available).
         timeout_seconds: Max time for synchronous run via console.
 
@@ -889,7 +889,7 @@ async def run_post_module(
     module_name: str,
     session_id: int,
     options: Dict[str, Any] = None,
-    run_as_job: bool = True,
+    run_as_job: bool = False,
     timeout_seconds: int = LONG_CONSOLE_READ_TIMEOUT
 ) -> Dict[str, Any]:
     """
@@ -899,7 +899,7 @@ async def run_post_module(
         module_name: Name/path of the post module (e.g., 'windows/gather/enum_shares').
         session_id: The ID of the target session.
         options: Dictionary of module options. 'SESSION' will be added automatically.
-        run_as_job: If True (default), run async via RPC. If False, run sync via console.
+        run_as_job: If False (default), run sync via console. If True, run async via RPC.
         timeout_seconds: Max time for synchronous run via console.
 
     Returns:
