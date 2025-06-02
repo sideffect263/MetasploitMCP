@@ -20,7 +20,6 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from pymetasploit3.msfrpc import MsfConsole, MsfRpcClient, MsfRpcError
 from starlette.applications import Starlette
-from starlette.responses import HTMLResponse # Added for serving HTML
 from starlette.routing import Mount, Route, Router
 
 # --- Configuration & Constants ---
@@ -810,7 +809,7 @@ async def run_exploit(
     options: Dict[str, Any],
     payload_name: Optional[str] = None,
     payload_options: Optional[Dict[str, Any]] = None,
-    run_as_job: bool = True,
+    run_as_job: bool = False,
     check_vulnerability: bool = False, # New option
     timeout_seconds: int = LONG_CONSOLE_READ_TIMEOUT # Used only if run_as_job=False
 ) -> Dict[str, Any]:
@@ -823,7 +822,7 @@ async def run_exploit(
         options: Dictionary of exploit module options (e.g., {'RHOSTS': '192.168.1.1'}).
         payload_name: Name of the payload (e.g., 'linux/x86/meterpreter/reverse_tcp').
         payload_options: Dictionary of payload options (e.g., {'LHOST': '...', 'LPORT': ...}).
-        run_as_job: If True (default), run async via RPC. If False, run sync via console.
+        run_as_job: If False (default), run sync via console. If True, run async via RPC.
         check_vulnerability: If True, run module's 'check' action first (if available).
         timeout_seconds: Max time for synchronous run via console.
 
@@ -890,7 +889,7 @@ async def run_post_module(
     module_name: str,
     session_id: int,
     options: Dict[str, Any] = None,
-    run_as_job: bool = True,
+    run_as_job: bool = False,
     timeout_seconds: int = LONG_CONSOLE_READ_TIMEOUT
 ) -> Dict[str, Any]:
     """
@@ -900,7 +899,7 @@ async def run_post_module(
         module_name: Name/path of the post module (e.g., 'windows/gather/enum_shares').
         session_id: The ID of the target session.
         options: Dictionary of module options. 'SESSION' will be added automatically.
-        run_as_job: If True (default), run async via RPC. If False, run sync via console.
+        run_as_job: If False (default), run sync via console. If True, run async via RPC.
         timeout_seconds: Max time for synchronous run via console.
 
     Returns:
@@ -1075,20 +1074,16 @@ async def send_session_command(
 
         if session_type == 'meterpreter':
             logger.debug(f"Using session.run_with_output for Meterpreter session {session_id}")
-            terminators = ['meterpreter > ']
             try:
-                output = await asyncio.to_thread(
-                    lambda: session.run_with_output(
-                        command,
-                        terminating_strs=terminators,
-                        timeout=timeout_seconds,
-                        timeout_exception=True # Raise TimeoutError on timeout
-                    )
+                # Use asyncio.wait_for to handle timeout manually since run_with_output doesn't support timeout parameter
+                output = await asyncio.wait_for(
+                    asyncio.to_thread(lambda: session.run_with_output(command)),
+                    timeout=timeout_seconds
                 )
                 status = "success"
                 message = "Meterpreter command executed successfully."
                 logger.debug(f"Meterpreter command '{command}' completed.")
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 status = "timeout"
                 message = f"Meterpreter command timed out after {timeout_seconds} seconds."
                 logger.warning(f"Command '{command}' timed out on Meterpreter session {session_id}")
@@ -1405,40 +1400,26 @@ app = FastAPI(
     version="1.6.0", # Incremented version
 )
 
-# Setup MCP transport (SSE for HTTP mode) - Updated path
-sse = SseServerTransport("/mcp/messages/")
+# --- Serve Landing Page and Static Files ---
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, RedirectResponse
 
-@app.get("/healthz", tags=["Health"])
-async def health_check():
-    """Check connectivity to the Metasploit RPC service."""
-    try:
-        client = get_msf_client() # Will raise ConnectionError if not init
-        logger.debug("Executing health check MSF call (core.version)...")
-        # Use a lightweight call like core.version
-        version_info = await asyncio.to_thread(lambda: client.core.version)
-        msf_version = version_info.get('version', 'N/A') if isinstance(version_info, dict) else 'N/A'
-        logger.info(f"Health check successful. MSF Version: {msf_version}")
-        return {"status": "ok", "msf_version": msf_version}
-    except (MsfRpcError, ConnectionError) as e:
-        logger.error(f"Health check failed - MSF RPC connection error: {e}")
-        raise HTTPException(status_code=503, detail=f"Metasploit Service Unavailable: {e}")
-    except Exception as e:
-        logger.exception("Unexpected error during health check.")
-        raise HTTPException(status_code=500, detail=f"Internal Server Error during health check: {e}")
+# Mount static files
+if os.path.exists("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
 
-@app.get("/", response_class=HTMLResponse, tags=["Documentation"])
-async def get_documentation():
-    """Serves the main documentation page."""
-    try:
-        with open("index.html", "r", encoding="utf-8") as f:
-            html_content = f.read()
-        return HTMLResponse(content=html_content)
-    except FileNotFoundError:
-        logger.error("index.html not found.")
-        raise HTTPException(status_code=404, detail="Documentation file not found.")
-    except Exception as e:
-        logger.exception("Error reading documentation file.")
-        raise HTTPException(status_code=500, detail="Internal server error serving documentation.")
+# Serve landing page at root
+@app.get("/", include_in_schema=False)
+async def serve_landing_page():
+    """Serve the landing page."""
+    index_path = os.path.join("static", "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    else:
+        return RedirectResponse(url="/docs")
+
+# Setup MCP transport (SSE for HTTP mode)
+sse = SseServerTransport("/messages/")
 
 # Define ASGI handlers properly with Starlette's ASGIApp interface
 class SseEndpoint:
@@ -1459,15 +1440,32 @@ class MessagesEndpoint:
         logger.info(f"Received POST message from {client_host}:{client_port}")
         await sse.handle_post_message(scope, receive, send)
 
-# Create routes using the ASGIApp-compliant classes - Updated paths
+# Create routes using the ASGIApp-compliant classes
 mcp_router = Router([
-    Route("/sse", endpoint=SseEndpoint(), methods=["GET"]),      # Path relative to the mount point
-    Route("/messages/", endpoint=MessagesEndpoint(), methods=["POST"]), # Path relative to the mount point
+    Route("/sse", endpoint=SseEndpoint(), methods=["GET"]),
+    Route("/messages/", endpoint=MessagesEndpoint(), methods=["POST"]),
 ])
 
-# Mount the MCP router to the main app under /mcp/ prefix
-# This should come after other specific routes like /healthz and / are defined on 'app'
-app.routes.append(Mount("/mcp", app=mcp_router)) # MCP endpoints are now under /mcp/
+# Mount the MCP router to the main app
+app.routes.append(Mount("/", app=mcp_router))
+
+@app.get("/healthz", tags=["Health"])
+async def health_check():
+    """Check connectivity to the Metasploit RPC service."""
+    try:
+        client = get_msf_client() # Will raise ConnectionError if not init
+        logger.debug("Executing health check MSF call (core.version)...")
+        # Use a lightweight call like core.version
+        version_info = await asyncio.to_thread(lambda: client.core.version)
+        msf_version = version_info.get('version', 'N/A') if isinstance(version_info, dict) else 'N/A'
+        logger.info(f"Health check successful. MSF Version: {msf_version}")
+        return {"status": "ok", "msf_version": msf_version}
+    except (MsfRpcError, ConnectionError) as e:
+        logger.error(f"Health check failed - MSF RPC connection error: {e}")
+        raise HTTPException(status_code=503, detail=f"Metasploit Service Unavailable: {e}")
+    except Exception as e:
+        logger.exception("Unexpected error during health check.")
+        raise HTTPException(status_code=500, detail=f"Internal Server Error during health check: {e}")
 
 # --- Server Startup Logic ---
 
@@ -1528,8 +1526,7 @@ if __name__ == "__main__":
             selected_port = find_available_port(start_port, host=check_host)
 
         logger.info(f"Starting Uvicorn HTTP server on http://{args.host}:{selected_port}")
-        logger.info(f"Documentation available at http://{args.host}:{selected_port}/") # Updated
-        logger.info(f"MCP SSE Endpoint: /mcp/sse") # Updated
+        logger.info(f"MCP SSE Endpoint: /sse")
         logger.info(f"API Docs available at http://{args.host}:{selected_port}/docs")
         logger.info(f"Payload Save Directory: {PAYLOAD_SAVE_DIR}")
         logger.info(f"Auto-reload: {'Enabled' if args.reload else 'Disabled'}")

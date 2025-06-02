@@ -1,0 +1,14 @@
+{
+  "name": "metasploit-mcp-client",
+  "version": "1.0.0",
+  "description": "Node.js client for Metasploit MCP server",
+  "main": "mcp_sdk_client.js",
+  "scripts": {
+    "start": "node mcp_sdk_client.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^0.5.0",
+    "eventsource": "^2.0.2",
+    "node-fetch": "^2.6.7"
+  }
+} 

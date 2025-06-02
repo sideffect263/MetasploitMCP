@@ -1,0 +1,99 @@
+version: '3.8'
+
+services:
+  # Metasploit RPC Server
+  metasploit:
+    image: metasploitframework/metasploit-framework:latest
+    container_name: metasploit-rpc
+    command: >
+      sh -c "
+        echo 'Starting Metasploit RPC server...' &&
+        msfdb init &&
+        msfrpcd -P ${MSF_PASSWORD:-yourpassword} -S -a 0.0.0.0 -p 55553 -f
+      "
+    environment:
+      - DATABASE_URL=postgresql://msf:${DB_PASSWORD:-msfpassword}@postgres:5432/msf
+    ports:
+      - "55553:55553"  # RPC port (internal only, don't expose publicly)
+    networks:
+      - mcp-network
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "55553"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # PostgreSQL for Metasploit
+  postgres:
+    image: postgres:15-alpine
+    container_name: metasploit-db
+    environment:
+      - POSTGRES_USER=msf
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-msfpassword}
+      - POSTGRES_DB=msf
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - mcp-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U msf"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MCP Server
+  mcp-server:
+    build: .
+    container_name: metasploit-mcp-server
+    environment:
+      - MSF_PASSWORD=${MSF_PASSWORD:-yourpassword}
+      - MSF_SERVER=metasploit
+      - MSF_PORT=55553
+      - MSF_SSL=false
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    ports:
+      - "${MCP_PORT:-8085}:8085"  # Public facing port
+    networks:
+      - mcp-network
+    depends_on:
+      metasploit:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./payloads:/app/payloads  # Persist generated payloads
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Optional: Nginx reverse proxy with SSL
+  nginx:
+    image: nginx:alpine
+    container_name: mcp-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro  # Add your SSL certificates here
+    networks:
+      - mcp-network
+    depends_on:
+      - mcp-server
+    restart: unless-stopped
+    profiles:
+      - with-ssl  # Only start with --profile with-ssl
+
+networks:
+  mcp-network:
+    driver: bridge
+
+volumes:
+  postgres-data: 
